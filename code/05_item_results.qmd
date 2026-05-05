@@ -1,0 +1,1081 @@
+---
+title: "L2L Framework: TSE Evaluation"
+subtitle: "Script 05 — RQ1 (Item Selection), RQ2 (Construct Recovery), RQ3 (Item Measurement Error)"
+author: "Kevin Linares"
+date: today
+format:
+  pdf:
+    colorlinks: true
+    fig-pos: "H"
+    geometry: margin=1in
+    fontsize: 11pt
+    include-in-header:
+      text: |
+        \usepackage{fvextra}
+        \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+editor:
+  markdown:
+    wrap: 72
+---
+
+# Overview
+
+Three CFA/IRT model fits per fold define the evaluation:
+
+- **Gold standard:** CFA/IRT fit to full fold (training + test,
+  no masking).
+- **Listwise deletion:** CFA/IRT fit to training data only.
+- **Imputed:** CFA/IRT fit to training + imputed test.
+
+## Research Questions
+
+- **RQ1 — Psychometric context utilization:** Select best
+  LLM-tier on item-level metrics (weighted kappa, accuracy).
+- **RQ2 — Construct-level recovery:** Compare gold, deletion,
+  best L2L, best traditional on rank preservation (r) and
+  scale fidelity (regression slope).
+- **RQ3 — Item measurement error:** Quantify how imputation
+  distorts IRT item parameters (discrimination, thresholds)
+  relative to gold standard, using Biemer decomposition of
+  item parameter MSE into systematic (Bias²) and random
+  (Variance) components. Counterfactual = listwise deletion.
+
+# Setup
+
+```{r}
+#| label: setup
+
+library(lavaan)
+library(mirt)
+library(semTools)
+library(viridis)
+library(tictoc)
+
+set.seed(721)
+
+results_dir <- "D:/repos/UMD_classes_code/TSE_II_SURV721/results"
+
+llm_results  <- readRDS(file.path(results_dir,
+                                   "results_item.rds"))
+trad_results <- readRDS(file.path(results_dir,
+                                   "results_trad_item.rds"))
+load(file.path(results_dir, "fold_data.RData"))
+load(file.path(results_dir, "cfa_reporting.RData"))
+load(file.path(results_dir, "irt_models.RData"))
+masking_tbl <- readRDS(file.path(results_dir,
+                                  "masking_table.rds"))
+
+# ── tidyverse loaded last ────────────────────────────────────
+library(tidyverse)
+```
+
+# Data Preparation
+
+```{r}
+#| label: data-prep
+
+shared_cols <- c("survey", "fold_id", "n_masked", "tier",
+                 "method", "row_id", "item", "actual",
+                 "predicted", "cfa_baseline", "irt_baseline")
+
+all_results <- bind_rows(
+  trad_results |>
+    filter(!is.na(predicted)) |>
+    select(all_of(shared_cols)) |>
+    mutate(method_type = "Traditional"),
+  llm_results |>
+    filter(!is.na(predicted)) |>
+    select(all_of(shared_cols)) |>
+    mutate(method_type = "LLM")
+) |>
+  filter(method != "gemma3_27b") |>
+  mutate(
+    method_label = recode(method,
+      llama4_maverick = "Maverick",
+      claude_sonnet   = "Claude Sonnet",
+      mixgb           = "mixgb",
+      miceRanger      = "miceRanger"),
+    method_type = factor(method_type,
+                         levels = c("Traditional", "LLM")),
+    tier = factor(tier, levels = c("S", "P1", "P2")),
+    survey_label = if_else(survey == "lapop",
+                           "LAPOP Mexico",
+                           "Latinobarómetro Colombia")
+  )
+
+survey_config <- list(
+  lapop = list(
+    trust_items = c(
+      "justice_system", "electoral_tribunal", "armed_forces",
+      "legislature", "public_ministry", "police", "auditor",
+      "political_parties", "supreme_court", "municipality",
+      "media", "elections"),
+    cfa_syntax = '
+      Trust =~ justice_system + electoral_tribunal +
+               armed_forces + legislature + public_ministry +
+               police + auditor + political_parties +
+               supreme_court + municipality + media + elections
+      armed_forces ~~ legislature
+      public_ministry ~~ auditor
+    ',
+    trust_ascending = TRUE),
+  lb = list(
+    trust_items = c(
+      "Congress", "Natl_Govt", "Judiciary", "Parties",
+      "Electoral_Inst", "President"),
+    cfa_syntax = '
+      Political =~ Congress + Natl_Govt + Judiciary + Parties +
+                   Electoral_Inst + President
+      Natl_Govt ~~ President
+    ',
+    trust_ascending = FALSE)
+)
+
+cat("Combined (no Gemma):", nrow(all_results), "rows\n")
+```
+
+# Helper Functions
+
+```{r}
+#| label: fn-helpers
+
+# ── CFA: fit and score ───────────────────────────────────────
+fit_cfa_score <- function(data_mat, cfa_syntax, row_ids) {
+  tryCatch({
+    fit <- cfa(cfa_syntax, data = data_mat,
+               estimator = "ML", meanstructure = TRUE)
+    fs <- as.numeric(lavPredict(fit, method = "regression"))
+    omega <- as.numeric(semTools::compRelSEM(fit))
+    list(scores = tibble(row_id = row_ids, fs = fs),
+         omega = omega)
+  }, error = function(e) {
+    cat("  CFA failed:", conditionMessage(e), "\n")
+    list(scores = tibble(row_id = row_ids,
+                         fs = rep(NA_real_, length(row_ids))),
+         omega = NA_real_)
+  })
+}
+
+# ── IRT: fit and score (reverse-codes LB) ────────────────────
+fit_irt_score <- function(data_mat, trust_ascending, row_ids) {
+  item_max <- max(data_mat, na.rm = TRUE)
+  irt_data <- if (!trust_ascending) {
+    data_mat |>
+      mutate(across(everything(),
+                    function(x) as.integer(item_max + 1L - x)))
+  } else {
+    data_mat |>
+      mutate(across(everything(), as.integer))
+  }
+  tryCatch({
+    fit <- mirt(irt_data, 1, itemtype = "graded",
+                verbose = FALSE)
+    theta <- as.numeric(fscores(fit, method = "EAP")[, 1])
+    list(scores = tibble(row_id = row_ids, theta = theta))
+  }, error = function(e) {
+    cat("  IRT failed:", conditionMessage(e), "\n")
+    list(scores = tibble(row_id = row_ids,
+                         theta = rep(NA_real_,
+                                     length(row_ids))))
+  })
+}
+
+# ── Combined fit: CFA + IRT + correlation matrix ─────────────
+fit_both_models <- function(data_df, cfg, label = "") {
+  trust_items <- cfg$trust_items
+  row_ids <- data_df$row_id
+  data_mat <- data_df |>
+    select(all_of(trust_items)) |>
+    mutate(across(everything(), as.numeric))
+  cat("  Fitting:", label, "| N =", nrow(data_mat), "\n")
+  cfa_out <- fit_cfa_score(data_mat, cfg$cfa_syntax, row_ids)
+  irt_out <- fit_irt_score(data_mat, cfg$trust_ascending,
+                            row_ids)
+  cor_mat <- cor(data_mat, use = "pairwise.complete.obs")
+  scores <- cfa_out$scores |>
+    left_join(irt_out$scores, by = "row_id")
+  list(scores = scores, omega = cfa_out$omega,
+       cor_mat = cor_mat,
+       mean_theta = mean(scores$theta, na.rm = TRUE),
+       sd_theta = sd(scores$theta, na.rm = TRUE),
+       n = nrow(scores))
+}
+
+# ── Reconstruct training + imputed test ──────────────────────
+reconstruct_full_data <- function(survey_name, fold_i,
+                                   method_name, tier_name) {
+  cfg <- survey_config[[survey_name]]
+  train_df <- folds_list[[survey_name]] |>
+    filter(fold_id == fold_i, split == "train") |>
+    select(row_id, all_of(cfg$trust_items)) |>
+    mutate(across(all_of(cfg$trust_items), as.numeric))
+  test_df <- folds_list[[survey_name]] |>
+    filter(fold_id == fold_i, split == "test") |>
+    select(row_id, all_of(cfg$trust_items)) |>
+    mutate(across(all_of(cfg$trust_items), as.numeric))
+  preds <- all_results |>
+    filter(survey == survey_name, fold_id == fold_i,
+           method == method_name, tier == tier_name) |>
+    select(row_id, item, predicted) |>
+    mutate(predicted = as.numeric(predicted))
+  if (nrow(preds) == 0L) return(NULL)
+  preds_wide <- preds |>
+    pivot_wider(names_from = item, values_from = predicted,
+                names_prefix = "imp_")
+  test_merged <- test_df |>
+    left_join(preds_wide, by = "row_id")
+  test_imputed <- map_dfc(cfg$trust_items, function(it) {
+    actual_val <- test_merged[[it]]
+    imp_col <- paste0("imp_", it)
+    imp_val <- if (imp_col %in% names(test_merged)) {
+      test_merged[[imp_col]]
+    } else { NA_real_ }
+    tibble(!!it := if_else(!is.na(imp_val),
+                           imp_val, actual_val))
+  }) |>
+    mutate(row_id = test_merged$row_id)
+  bind_rows(train_df, test_imputed)
+}
+
+# ── Weighted kappa (quadratic weights) ───────────────────────
+compute_weighted_kappa <- function(actual, predicted) {
+  cats <- sort(unique(c(actual, predicted)))
+  k <- length(cats)
+  if (k < 2) return(NA_real_)
+  obs_tbl <- table(factor(actual, levels = cats),
+                   factor(predicted, levels = cats))
+  n <- sum(obs_tbl)
+  row_m <- rowSums(obs_tbl)
+  col_m <- colSums(obs_tbl)
+  exp_tbl <- outer(row_m, col_m) / n
+  w <- outer(seq_along(cats), seq_along(cats),
+             function(i, j) (i - j)^2 / (k - 1)^2)
+  1 - sum(w * obs_tbl) / sum(w * exp_tbl)
+}
+
+# ── IRT: fit and extract item parameters ─────────────────────
+# Returns discrimination (a) and raw intercepts (d) per item
+# Uses coef(fit, printSE = TRUE) pattern from Script 02
+fit_irt_extract <- function(data_df, cfg) {
+  items <- cfg$trust_items
+  data_mat <- data_df |>
+    select(all_of(items)) |>
+    mutate(across(everything(), as.numeric))
+  item_max <- max(data_mat, na.rm = TRUE)
+  irt_data <- if (!cfg$trust_ascending) {
+    data_mat |>
+      mutate(across(everything(),
+                    function(x) as.integer(item_max + 1L - x)))
+  } else {
+    data_mat |>
+      mutate(across(everything(), as.integer))
+  }
+
+  fit <- mirt(irt_data, 1, itemtype = "graded",
+              verbose = FALSE)
+  item_coefs <- coef(fit, printSE = TRUE)
+
+  map_dfr(items, function(item_name) {
+    mat <- item_coefs[[item_name]]
+    par_row <- mat["par", ]
+    param_names <- names(par_row)
+
+    # Discrimination
+    a_val <- par_row[["a1"]]
+
+    # Raw intercepts (d) — NOT converted to b
+    d_cols <- param_names[grepl("^d", param_names)]
+
+    # Also compute b = -d/a for reference
+    bind_rows(
+      tibble(item = item_name, param = "a", value = a_val),
+      map_dfr(d_cols, function(dc) {
+        d_val <- par_row[[dc]]
+        b_label <- gsub("^d", "b", dc)
+        tibble(item = item_name, param = dc, value = d_val)
+      })
+    )
+  })
+}
+```
+
+# Model Fitting
+
+```{r}
+#| label: gold-standard
+
+tic("Gold standard fits")
+gold_fits <- map_dfr(names(survey_config), function(s) {
+  cfg <- survey_config[[s]]
+  map_dfr(1:5, function(fi) {
+    full_df <- folds_list[[s]] |>
+      filter(fold_id == fi) |>
+      select(row_id, all_of(cfg$trust_items)) |>
+      mutate(across(all_of(cfg$trust_items), as.numeric))
+    result <- fit_both_models(
+      full_df, cfg, paste("Gold", s, "fold", fi))
+    tibble(survey = s, fold_id = fi,
+           condition = "Gold",
+           method_label = "Gold Standard",
+           omega = result$omega,
+           mean_theta = result$mean_theta,
+           sd_theta = result$sd_theta,
+           n = result$n,
+           scores = list(result$scores),
+           cor_mat = list(result$cor_mat))
+  })
+})
+toc()
+```
+
+```{r}
+#| label: deletion
+
+tic("Deletion fits")
+deletion_fits <- map_dfr(names(survey_config), function(s) {
+  cfg <- survey_config[[s]]
+  map_dfr(1:5, function(fi) {
+    train_df <- folds_list[[s]] |>
+      filter(fold_id == fi, split == "train") |>
+      select(row_id, all_of(cfg$trust_items)) |>
+      mutate(across(all_of(cfg$trust_items), as.numeric))
+    result <- fit_both_models(
+      train_df, cfg, paste("Deletion", s, "fold", fi))
+    tibble(survey = s, fold_id = fi,
+           condition = "Deletion",
+           method_label = "Listwise Deletion",
+           omega = result$omega,
+           mean_theta = result$mean_theta,
+           sd_theta = result$sd_theta,
+           n = result$n,
+           scores = list(result$scores),
+           cor_mat = list(result$cor_mat))
+  })
+})
+toc()
+```
+
+```{r}
+#| label: imputed-fits
+
+tic("All imputed fits")
+method_tier_grid <- all_results |>
+  distinct(survey, method, method_label, method_type, tier)
+cat("Fitting", nrow(method_tier_grid),
+    "method-tier combos × 5 folds\n")
+
+imputed_fits <- pmap_dfr(method_tier_grid, function(
+    survey, method, method_label, method_type, tier) {
+  cfg <- survey_config[[survey]]
+  map_dfr(1:5, function(fi) {
+    recon_df <- reconstruct_full_data(
+      survey, fi, method, as.character(tier))
+    if (is.null(recon_df)) {
+      return(tibble(
+        survey = survey, fold_id = fi,
+        condition = "Imputed",
+        method = method, method_label = method_label,
+        method_type = as.character(method_type),
+        tier = as.character(tier),
+        omega = NA_real_,
+        mean_theta = NA_real_, sd_theta = NA_real_,
+        n = 0L, scores = list(NULL),
+        cor_mat = list(NULL)))
+    }
+    result <- fit_both_models(
+      recon_df, cfg,
+      paste(method_label, tier, survey, "fold", fi))
+    tibble(survey = survey, fold_id = fi,
+           condition = "Imputed",
+           method = method, method_label = method_label,
+           method_type = as.character(method_type),
+           tier = as.character(tier),
+           omega = result$omega,
+           mean_theta = result$mean_theta,
+           sd_theta = result$sd_theta,
+           n = result$n,
+           scores = list(result$scores),
+           cor_mat = list(result$cor_mat))
+  })
+})
+toc()
+```
+
+\newpage
+
+# RQ1: Psychometric Context Utilization
+
+## Item-Level Metrics
+
+```{r}
+#| label: rq1-items
+
+rq1_item <- all_results |>
+  group_by(survey, survey_label, method, method_label,
+           method_type, tier, fold_id) |>
+  summarise(
+    accuracy = mean(predicted == actual),
+    mae = mean(abs(predicted - actual)),
+    wkappa = compute_weighted_kappa(actual, predicted),
+    .groups = "drop")
+
+rq1_item_summary <- rq1_item |>
+  group_by(survey, survey_label, method, method_label,
+           method_type, tier) |>
+  summarise(
+    accuracy = round(mean(accuracy), 3),
+    mae = round(mean(mae), 3),
+    wkappa = round(mean(wkappa), 3),
+    .groups = "drop")
+```
+
+```{r}
+#| label: tbl-rq1
+#| tbl-cap: "RQ1: Item-Level Metrics — All Methods × Tiers (5-Fold CV). Wκ = quadratic weighted kappa."
+
+rq1_item_summary |>
+  select(Survey = survey_label, Type = method_type,
+         Method = method_label, Tier = tier,
+         Acc = accuracy, MAE = mae, `Wκ` = wkappa) |>
+  arrange(Survey, Type, Method, Tier) |>
+  knitr::kable(align = "lllcccc")
+```
+
+## Figure: Tier Effect on Item Recovery
+
+```{r}
+#| label: fig-rq1-tiers
+#| fig-cap: "RQ1: Item-Level Performance by Information Tier. All methods, both surveys. Upward trajectory from S to P2 confirms psychometric context improves item recovery."
+#| fig-width: 10
+#| fig-height: 5
+
+ggplot(rq1_item_summary,
+       aes(x = tier, y = wkappa,
+           color = method_label,
+           group = method_label,
+           linetype = method_type)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ survey_label, scales = "free_y") +
+  scale_color_viridis_d(option = "D", end = 0.85) +
+  labs(x = "Information Tier",
+       y = "Weighted Kappa",
+       color = "Method", linetype = "Type") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+```
+
+\newpage
+
+# RQ2: Construct-Level Recovery
+
+## Person-Level θ Matching
+
+```{r}
+#| label: rq2-matching
+
+# ── Match imputed θ to gold θ for test respondents ───────────
+rq2_person <- pmap_dfr(
+  imputed_fits |>
+    filter(!map_lgl(scores, is.null)) |>
+    select(survey, fold_id, method, method_label,
+           method_type, tier, scores),
+  function(survey, fold_id, method, method_label,
+           method_type, tier, scores) {
+    gold_scores <- gold_fits |>
+      filter(survey == !!survey,
+             fold_id == !!fold_id) |>
+      pull(scores) |> pluck(1)
+    if (is.null(gold_scores)) return(NULL)
+    test_ids <- folds_list[[survey]] |>
+      filter(fold_id == !!fold_id, split == "test") |>
+      pull(row_id)
+    gold_scores |>
+      filter(row_id %in% test_ids) |>
+      rename(theta_gold = theta, fs_gold = fs) |>
+      inner_join(
+        scores |> rename(theta_imp = theta, fs_imp = fs),
+        by = "row_id") |>
+      mutate(survey = survey, fold_id = fold_id,
+             method = method, method_label = method_label,
+             method_type = method_type, tier = tier)
+  }
+) |>
+  mutate(survey_label = if_else(survey == "lapop",
+    "LAPOP Mexico", "Latinobarómetro Colombia"))
+
+cat("RQ2 person-level:", nrow(rq2_person), "rows\n")
+```
+
+## Correlation and Slope
+
+```{r}
+#| label: rq2-metrics
+
+rq2_metrics <- rq2_person |>
+  group_by(survey, survey_label, method, method_label,
+           method_type, tier, fold_id) |>
+  summarise(
+    r = cor(theta_gold, theta_imp, use = "complete.obs"),
+    slope = coef(lm(theta_imp ~ theta_gold))[["theta_gold"]],
+    .groups = "drop")
+
+rq2_summary <- rq2_metrics |>
+  group_by(survey_label, method_type, method_label, tier) |>
+  summarise(
+    r = round(mean(r, na.rm = TRUE), 4),
+    slope = round(mean(slope, na.rm = TRUE), 4),
+    .groups = "drop")
+```
+
+```{r}
+#| label: tbl-rq2
+#| tbl-cap: "RQ2: Construct Recovery — Correlation (r) and Regression Slope of θ_imputed on θ_gold. r = rank preservation; slope = scale fidelity (1.0 = perfect, <1 = compression)."
+
+rq2_summary |>
+  select(Survey = survey_label, Type = method_type,
+         Method = method_label, Tier = tier,
+         r, Slope = slope) |>
+  arrange(Survey, Tier, desc(r)) |>
+  knitr::kable(align = "lllccc")
+```
+
+## Figure: θ Recovery Scatterplots
+
+```{r}
+#| label: fig-rq2-scatter
+#| fig-cap: "RQ2: Construct Recovery — θ_gold vs. θ_imputed for Claude P2 and mixgb S (Fold 1). Solid line = regression fit; dashed = identity. Deviation from slope = 1 indicates compression or expansion."
+#| fig-width: 10
+#| fig-height: 5
+
+scatter_data <- rq2_person |>
+  filter(fold_id == 1,
+         (method == "claude_sonnet" & tier == "P2") |
+         (method == "mixgb" & tier == "S")) |>
+  mutate(label = paste(method_label,
+                        if_else(method_type == "LLM",
+                                "(P2)", "(S)")))
+
+ggplot(scatter_data,
+       aes(x = theta_gold, y = theta_imp)) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "grey50",
+              linewidth = 0.5) +
+  geom_point(alpha = 0.15, size = 0.8,
+             color = viridis(3)[2]) +
+  geom_smooth(method = "lm", se = FALSE,
+              color = viridis(3)[1],
+              linewidth = 0.9) +
+  facet_grid(label ~ survey_label, scales = "free") +
+  labs(x = expression(theta[gold]),
+       y = expression(theta[imputed])) +
+  theme_minimal(base_size = 11) +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+## Figure: Correlation by Method and Tier
+
+```{r}
+#| label: fig-rq2-r
+#| fig-cap: "RQ2: Rank Preservation (r) by Method and Tier. All methods on both surveys."
+#| fig-width: 10
+#| fig-height: 5
+
+ggplot(rq2_summary,
+       aes(x = tier, y = r,
+           color = method_label,
+           group = method_label,
+           linetype = method_type)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ survey_label, scales = "free_y") +
+  scale_color_viridis_d(option = "D", end = 0.85) +
+  labs(x = "Information Tier",
+       y = "Correlation (r) with Gold Standard θ",
+       color = "Method", linetype = "Type") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+```
+
+\newpage
+
+
+# RQ3: Item Measurement Error
+
+RQ3 asks: what does imputation do to the measurement model's
+item parameters? We refit IRT-GRM on four conditions per fold
+(gold, deletion, Claude P2, mixgb S), extract discrimination
+(a) and raw intercept (d) parameters, and decompose per-item
+MSE into Bias² + Variance following Biemer (2010). Item-level
+response variance is also compared across conditions.
+
+## Extract IRT Item Parameters
+
+```{r}
+#| label: rq3-extract
+
+tic("IRT parameter extraction")
+rq3_irt_params <- map_dfr(c("lapop", "lb"), function(s) {
+  cfg <- survey_config[[s]]
+  map_dfr(1:5, function(fi) {
+    cat("  Extracting:", s, "fold", fi, "\n")
+
+    # Gold: full fold (training + test, no masking)
+    gold_df <- folds_list[[s]] |>
+      filter(fold_id == fi) |>
+      select(row_id, all_of(cfg$trust_items)) |>
+      mutate(across(all_of(cfg$trust_items), as.numeric))
+    gold_p <- fit_irt_extract(gold_df, cfg) |>
+      mutate(condition = "Gold")
+
+    # Deletion: training only (listwise deletion of test fold)
+    del_df <- folds_list[[s]] |>
+      filter(fold_id == fi, split == "train") |>
+      select(row_id, all_of(cfg$trust_items)) |>
+      mutate(across(all_of(cfg$trust_items), as.numeric))
+    del_p <- fit_irt_extract(del_df, cfg) |>
+      mutate(condition = "Deletion")
+
+    # Claude Sonnet P2 (best LLM configuration)
+    claude_df <- reconstruct_full_data(
+      s, fi, "claude_sonnet", "P2")
+    claude_p <- fit_irt_extract(claude_df, cfg) |>
+      mutate(condition = "Claude P2")
+
+    # mixgb S (traditional benchmark — fair comparison tier)
+    mixgb_df <- reconstruct_full_data(s, fi, "mixgb", "S")
+    mixgb_p <- if (!is.null(mixgb_df)) {
+      fit_irt_extract(mixgb_df, cfg) |>
+        mutate(condition = "mixgb S")
+    } else {
+      tibble(item = character(), param = character(),
+             value = numeric(), condition = character())
+    }
+
+    bind_rows(gold_p, del_p, claude_p, mixgb_p) |>
+      mutate(survey = s, fold_id = fi)
+  })
+}) |>
+  mutate(
+    survey_label = if_else(survey == "lapop",
+      "LAPOP Mexico", "Latinobarómetro Colombia"),
+    condition = factor(condition,
+      levels = c("Gold", "Deletion", "Claude P2", "mixgb S"))
+  )
+toc()
+
+cat("RQ3 IRT params:", nrow(rq3_irt_params), "rows\n")
+```
+
+## Discrimination (a): Biemer Decomposition
+
+```{r}
+#| label: rq3-discrim
+
+# ── Per item × fold: Δa for all conditions vs Gold ───────────
+rq3_delta_a <- rq3_irt_params |>
+  filter(param == "a") |>
+  select(survey_label, item, fold_id, condition, value) |>
+  pivot_wider(names_from = condition,
+              values_from = value) |>
+  mutate(
+    delta_claude = `Claude P2` - Gold,
+    delta_del    = Deletion - Gold,
+    delta_mixgb  = `mixgb S` - Gold
+  )
+
+# ── Helper: Biemer decomposition for any delta column ────────
+# Returns per-item Bias, Bias², Variance, MSE, and % Syst
+biemer_decompose <- function(data, delta_col, config_label) {
+  data |>
+    group_by(survey_label, item) |>
+    summarise(
+      gold_a   = round(mean(Gold), 3),
+      bias     = round(mean(.data[[delta_col]]), 4),
+      bias_sq  = mean(.data[[delta_col]])^2,
+      variance = var(.data[[delta_col]]),
+      mse      = mean(.data[[delta_col]]^2),
+      pct_syst = round(
+        if_else(mean(.data[[delta_col]]^2) > 0,
+                mean(.data[[delta_col]])^2 /
+                  mean(.data[[delta_col]]^2) * 100,
+                0), 1),
+      .groups = "drop"
+    ) |>
+    mutate(config = config_label) |>
+    arrange(survey_label, desc(mse))
+}
+
+# ── Apply to all three conditions ─────────────────────────────
+rq3_biemer_claude <- biemer_decompose(
+  rq3_delta_a, "delta_claude", "Claude P2")
+rq3_biemer_del <- biemer_decompose(
+  rq3_delta_a, "delta_del", "Deletion")
+rq3_biemer_mixgb <- biemer_decompose(
+  rq3_delta_a, "delta_mixgb", "mixgb S")
+```
+
+## Table: Item-Level Biemer — Claude P2 vs mixgb S
+
+```{r}
+#| label: tbl-rq3-discrim
+#| tbl-cap: "RQ3: IRT Discrimination (a) — Biemer Decomposition. Claude P2 and mixgb S vs Gold Standard. Bias = mean Δa across 5 folds. MSE = Bias² + Variance."
+
+# ── Side-by-side item-level table ─────────────────────────────
+rq3_item_compare <- rq3_biemer_claude |>
+  select(survey_label, item, gold_a,
+         bias_c = bias, mse_c = mse, pct_c = pct_syst) |>
+  left_join(
+    rq3_biemer_mixgb |>
+      select(survey_label, item,
+             bias_m = bias, mse_m = mse, pct_m = pct_syst),
+    by = c("survey_label", "item")
+  ) |>
+  arrange(survey_label, desc(gold_a))
+
+rq3_item_compare |>
+  mutate(
+    bias_c = sprintf("%+.4f", bias_c),
+    mse_c  = sprintf("%.4f", mse_c),
+    bias_m = sprintf("%+.4f", bias_m),
+    mse_m  = sprintf("%.4f", mse_m)
+  ) |>
+  select(Survey = survey_label, Item = item,
+         `Gold a` = gold_a,
+         `Claude Bias` = bias_c, `Claude MSE` = mse_c,
+         `Claude %Sys` = pct_c,
+         `mixgb Bias` = bias_m, `mixgb MSE` = mse_m,
+         `mixgb %Sys` = pct_m) |>
+  knitr::kable(align = "llccccccc")
+```
+
+## Table: Aggregate MSE Summary (Three Conditions)
+
+```{r}
+#| label: tbl-rq3-discrim-agg
+#| tbl-cap: "RQ3: Discrimination MSE Summary — Claude P2, mixgb S, and Deletion. Mean across items per survey."
+
+bind_rows(
+  rq3_biemer_claude, rq3_biemer_mixgb, rq3_biemer_del
+) |>
+  group_by(survey_label, config) |>
+  summarise(
+    mean_bias    = round(mean(bias), 4),
+    mean_bias_sq = round(mean(bias_sq), 6),
+    mean_var     = round(mean(variance), 6),
+    mean_mse     = round(mean(mse), 6),
+    mean_pct     = round(mean(pct_syst), 1),
+    .groups = "drop"
+  ) |>
+  mutate(
+    config = factor(config,
+      levels = c("Claude P2", "mixgb S", "Deletion"))
+  ) |>
+  select(Survey = survey_label, Condition = config,
+         Bias = mean_bias, `Bias²` = mean_bias_sq,
+         Variance = mean_var, MSE = mean_mse,
+         `% Syst` = mean_pct) |>
+  arrange(Survey, Condition) |>
+  knitr::kable(align = "llccccc")
+```
+
+## Figure: Discrimination Shift Dumbbell (Claude P2 vs mixgb S)
+
+```{r}
+#| label: fig-rq3-dumbbell
+#| fig-cap: "RQ3: IRT Discrimination Shift by Item — Claude P2 vs mixgb S. Each segment connects the two methods' mean Δa (condition − Gold) for the same item. Vertical dashed line = gold standard (no distortion)."
+#| fig-width: 10
+#| fig-height: 6
+
+# ── Build dumbbell data ───────────────────────────────────────
+dumbbell_df <- rq3_biemer_claude |>
+  select(survey_label, item, gold_a,
+         bias_claude = bias) |>
+  left_join(
+    rq3_biemer_mixgb |>
+      select(survey_label, item, bias_mixgb = bias),
+    by = c("survey_label", "item")
+  )
+
+# ── Viridis colors for the two methods ────────────────────────
+method_colors <- c("Claude P2" = viridis(4)[3],
+                   "mixgb S"   = viridis(4)[1])
+
+ggplot(dumbbell_df, aes(y = reorder(item, gold_a))) +
+  # Zero reference line (gold standard = no distortion)
+  geom_vline(xintercept = 0, linetype = "dashed",
+             color = "grey50") +
+  # Connecting segment between methods per item
+  geom_segment(
+    aes(x = bias_claude, xend = bias_mixgb,
+        yend = reorder(item, gold_a)),
+    color = "grey60", linewidth = 0.6
+  ) +
+  # Claude P2 points
+  geom_point(aes(x = bias_claude, color = "Claude P2"),
+             size = 3) +
+  # mixgb S points
+  geom_point(aes(x = bias_mixgb, color = "mixgb S"),
+             size = 3) +
+  # Labels: Claude P2
+  geom_text(
+    aes(x = bias_claude,
+        label = sprintf("%+.3f", bias_claude)),
+    hjust = -0.3, size = 2.5, color = viridis(4)[3]
+  ) +
+  # Labels: mixgb S
+  geom_text(
+    aes(x = bias_mixgb,
+        label = sprintf("%+.3f", bias_mixgb)),
+    hjust = 1.3, size = 2.5, color = viridis(4)[1]
+  ) +
+  facet_wrap(~ survey_label, scales = "free") +
+  scale_color_manual(values = method_colors, name = NULL) +
+  labs(
+    x = expression(Delta * "a (Condition − Gold)"),
+    y = NULL,
+    title = "Discrimination shift: Claude P2 vs mixgb S"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+## Figure: Biemer Decomposition — Both Methods
+
+```{r}
+#| label: fig-rq3-biemer
+#| fig-cap: "RQ3: Biemer Decomposition of Discrimination MSE — Claude P2 vs mixgb S. Dark fill = Bias² (systematic), light fill = Variance (random). Labels show total MSE and % systematic."
+#| fig-width: 10
+#| fig-height: 7
+
+# ── Combine both imputation methods for stacked bar ───────────
+biemer_both <- bind_rows(rq3_biemer_claude, rq3_biemer_mixgb)
+
+biemer_long <- biemer_both |>
+  pivot_longer(cols = c(bias_sq, variance),
+               names_to = "component",
+               values_to = "comp_value") |>
+  mutate(
+    component = factor(component,
+      levels = c("bias_sq", "variance"),
+      labels = c("Bias²", "Variance")),
+    config = factor(config,
+      levels = c("Claude P2", "mixgb S"))
+  )
+
+ggplot(biemer_long,
+       aes(x = comp_value,
+           y = reorder(item, comp_value),
+           fill = component)) +
+  geom_col(width = 0.6, position = "stack") +
+  geom_text(
+    data = biemer_both,
+    aes(x = mse,
+        y = reorder(item, mse),
+        label = paste0(sprintf("%.4f", mse),
+                       "  (", pct_syst, "%)"),
+        fill = NULL),
+    hjust = -0.05, size = 2.5
+  ) +
+  facet_grid(config ~ survey_label, scales = "free") +
+  scale_fill_manual(
+    values = c("Bias²"    = viridis(3)[2],
+               "Variance" = "grey75"),
+    name = NULL
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.40))) +
+  labs(
+    x = "MSE of Discrimination (a)",
+    y = NULL,
+    title = "Biemer decomposition: MSE = Bias² + Variance"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+## Item-Level Response Variance
+
+```{r}
+#| label: rq3-item-var
+
+# ── Per-item variance: Gold vs Deletion vs Claude P2
+#    vs mixgb S ────────────────────────────────────────────────
+rq3_item_var <- map_dfr(c("lapop", "lb"), function(s) {
+  cfg <- survey_config[[s]]
+  items <- cfg$trust_items
+  map_dfr(1:5, function(fi) {
+    gold_data <- folds_list[[s]] |>
+      filter(fold_id == fi) |>
+      select(all_of(items)) |>
+      mutate(across(everything(), as.numeric))
+    del_data <- folds_list[[s]] |>
+      filter(fold_id == fi, split == "train") |>
+      select(all_of(items)) |>
+      mutate(across(everything(), as.numeric))
+    claude_data <- reconstruct_full_data(
+      s, fi, "claude_sonnet", "P2") |>
+      select(all_of(items))
+    mixgb_recon <- reconstruct_full_data(
+      s, fi, "mixgb", "S")
+    mixgb_data <- if (!is.null(mixgb_recon)) {
+      mixgb_recon |> select(all_of(items))
+    } else { NULL }
+    map_dfr(items, function(it) {
+      tibble(
+        survey = s, fold_id = fi, item = it,
+        var_gold   = var(gold_data[[it]], na.rm = TRUE),
+        var_del    = var(del_data[[it]], na.rm = TRUE),
+        var_claude = var(claude_data[[it]], na.rm = TRUE),
+        var_mixgb  = if (!is.null(mixgb_data)) {
+          var(mixgb_data[[it]], na.rm = TRUE)
+        } else { NA_real_ }
+      )
+    })
+  })
+}) |>
+  mutate(
+    survey_label = if_else(survey == "lapop",
+      "LAPOP Mexico", "Latinobarómetro Colombia"),
+    pct_claude = round((var_claude - var_gold) /
+                        var_gold * 100, 2),
+    pct_del    = round((var_del - var_gold) /
+                        var_gold * 100, 2),
+    pct_mixgb  = round((var_mixgb - var_gold) /
+                        var_gold * 100, 2)
+  )
+
+# ── Summary across folds ─────────────────────────────────────
+rq3_var_summary <- rq3_item_var |>
+  group_by(survey_label, item) |>
+  summarise(
+    var_gold   = round(mean(var_gold), 3),
+    var_claude = round(mean(var_claude), 3),
+    var_del    = round(mean(var_del), 3),
+    var_mixgb  = round(mean(var_mixgb, na.rm = TRUE), 3),
+    pct_claude = round(mean(pct_claude), 2),
+    pct_del    = round(mean(pct_del), 2),
+    pct_mixgb  = round(mean(pct_mixgb, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+```
+
+```{r}
+#| label: tbl-rq3-var
+#| tbl-cap: "RQ3: Item-Level Response Variance — Gold vs Deletion vs Claude P2 vs mixgb S. pct = % change from gold. Negative = variance shrinkage."
+
+rq3_var_summary |>
+  arrange(survey_label, item) |>
+  select(Survey = survey_label, Item = item,
+         `Gold` = var_gold,
+         `Claude` = var_claude, `%C` = pct_claude,
+         `mixgb` = var_mixgb, `%M` = pct_mixgb,
+         `Del` = var_del, `%D` = pct_del) |>
+  knitr::kable(align = "llccccccc")
+```
+
+## Figure: Item Variance Shrinkage
+
+```{r}
+#| label: fig-rq3-var
+#| fig-cap: "RQ3: Item-Level Variance Change vs Gold. Claude P2 and mixgb S both shrink item response variance; the method with less shrinkage preserves the measurement model's error structure more faithfully."
+#| fig-width: 10
+#| fig-height: 6
+
+# ── Long format for plotting both methods ─────────────────────
+var_long <- rq3_var_summary |>
+  pivot_longer(
+    cols = c(pct_claude, pct_mixgb),
+    names_to = "method",
+    values_to = "pct_change"
+  ) |>
+  mutate(
+    method = recode(method,
+      pct_claude = "Claude P2",
+      pct_mixgb  = "mixgb S"),
+    method = factor(method,
+      levels = c("Claude P2", "mixgb S"))
+  )
+
+ggplot(var_long,
+       aes(x = pct_change,
+           y = reorder(item, pct_change),
+           color = method)) +
+  geom_vline(xintercept = 0, linetype = "dashed",
+             color = "grey50") +
+  geom_point(size = 2.5,
+             position = position_dodge(0.4)) +
+  facet_wrap(~ survey_label, scales = "free") +
+  scale_color_manual(
+    values = c("Claude P2" = viridis(4)[3],
+               "mixgb S"   = viridis(4)[1]),
+    name = NULL
+  ) +
+  labs(
+    x = "% change in item variance (vs Gold)",
+    y = NULL,
+    title = "Item-level variance shrinkage: Claude P2 vs mixgb S"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+\newpage
+
+# Save All Results
+
+```{r}
+#| label: save
+
+saveRDS(rq1_item,
+  file.path(results_dir, "rq1_item_metrics.rds"))
+saveRDS(rq2_person,
+  file.path(results_dir, "rq2_person_recovery.rds"))
+
+save(
+  # Model fits
+  gold_fits, deletion_fits, imputed_fits,
+  # RQ1
+  rq1_item, rq1_item_summary,
+  # RQ2
+  rq2_person, rq2_metrics, rq2_summary,
+  # RQ3
+  rq3_irt_params, rq3_delta_a,
+  rq3_biemer_claude, rq3_biemer_mixgb, rq3_biemer_del,
+  rq3_item_var, rq3_var_summary,
+  file = file.path(results_dir, "evaluation_rq.RData"))
+
+cat("Saved: evaluation_rq.RData,",
+    "rq1_item_metrics.rds,",
+    "rq2_person_recovery.rds\n")
+
+tibble(
+  Object = c("gold_fits", "deletion_fits", "imputed_fits",
+             "rq1_item", "rq2_person", "rq2_summary",
+             "rq3_irt_params", "rq3_biemer_claude",
+             "rq3_biemer_mixgb", "rq3_item_var"),
+  Rows = c(nrow(gold_fits), nrow(deletion_fits),
+           nrow(imputed_fits), nrow(rq1_item),
+           nrow(rq2_person), nrow(rq2_summary),
+           nrow(rq3_irt_params), nrow(rq3_biemer_claude),
+           nrow(rq3_biemer_mixgb), nrow(rq3_item_var))
+) |> knitr::kable()
+```

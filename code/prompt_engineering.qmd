@@ -1,0 +1,663 @@
+---
+title: "L2L Framework: Prompt Context Engineering"
+subtitle: "Design Rationale, Tier Architecture, and Production Decision Log"
+author: "Kevin Linares"
+date: today
+format:
+  pdf:
+    colorlinks: true
+    fig-pos: "H"
+    geometry: margin=1in
+    fontsize: 11pt
+    include-in-header:
+      text: |
+        \usepackage{fvextra}
+        \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+editor:
+  markdown:
+    wrap: 72
+---
+
+# Overview
+
+This document describes the prompt construction process for the
+Latent-to-Language (L2L) item imputation framework. It records the
+design rationale, tier structure, prompt architecture, iterative
+development decisions, and production results for peer review. No API
+calls are made here --- all prompts are printed from
+`item_prompt_functions.R` for inspection.
+
+The L2L framework tests whether translating psychometric model
+*conclusions* --- not raw parameters --- into natural language prompts
+enables LLMs to impute masked survey item responses competitively
+with tree-based methods. The production design uses a
+**model-then-adjust** paradigm: IRT/CFA model predictions serve as
+starting points that LLMs refine based on residual patterns,
+correlated-item signals, and demographic probability context.
+
+**Key design principle:** Prompts communicate model conclusions in
+natural language. The LLM is a reasoner, not a calculator. It never
+sees discrimination parameters, factor loadings, Q3 matrices, or
+threshold tables.
+
+All prompt construction functions are in `item_prompt_functions.R`,
+a self-contained R script sourced by Script 04:
+
+```r
+source("D:/repos/UMD_classes_code/TSE_II_SURV721/code/item_prompt_functions.R")
+```
+
+# Tier Structure
+
+## Output Format
+
+Batch prompting with model-specific batch sizes: Claude Sonnet = 50,
+Gemma 27B = 25, Maverick = 25. Each respondent block shows
+demographics, observed items with verbal labels and `[MISSING]`
+markers, and tier-specific psychometric context. Output is one line
+per respondent: `row_id: item1=value, item2=value`.
+
+## LLM Tiers
+
+- **S (Demographics only):** Demographics + observed trust items as
+  verbal labels + `[MISSING]` markers. Pure world-knowledge
+  prediction. No model predictions, no psychometric context.
+
+- **P1 (CFA augmented):** S + per-respondent CFA factor score
+  (percentile and verbal label) + per-masked-item CFA prediction
+  anchor + 2 most correlated observed items with CFA residuals +
+  overall residual pattern summary.
+
+- **P2 (IRT augmented):** S + per-masked-item IRT modal prediction
+  with verbal confidence level and top-2 category probabilities +
+  2 most correlated observed items with IRT residuals + overall IRT
+  residual pattern + demographic probability context
+  (P(high trust | group) vs. population).
+
+## Traditional Method Tiers (Script 03)
+
+- **S:** Demographics + observed trust items (masked as NA)
+- **P1:** S + CFA factor score (from partial data)
+- **P2:** S + IRT $\theta$ (from partial data, no SE)
+
+## Demographics (Screened by Script 02)
+
+Demographics were screened using eta-squared with both IRT theta and
+CFA factor score (threshold: $\eta^2 \geq 0.005$). Each survey
+retains only demographics that pass screening:
+
+- **LAPOP Mexico:** age\_cat, Edu, Urban, Employment (male dropped,
+  $\eta^2 = 0.0005$ with $\theta$, $0.0007$ with CFA)
+- **LB Colombia:** age\_cat, Edu, Employment (male and Urban dropped)
+
+# Psychometrician Persona
+
+The system prompt uses a specific persona: a survey psychometrician
+with a PhD from JPSM at the University of Maryland, specializing in
+survey data science. The persona establishes domain expertise in
+institutional trust measurement for Latin American populations.
+
+The system prompt frames the task as **refinement**, not binary
+keep/adjust:
+
+> "Your job is to REFINE these predictions using information the
+> model cannot capture. The model only sees numerical patterns ---
+> you can see response consistency, demographic context, and
+> institutional meaning."
+
+## Reasoning Rules (System Prompt)
+
+1. **Residual pattern is the strongest signal.** If the respondent
+   consistently rates above or below the model on observed items,
+   adjust in that direction.
+
+2. **Correlated items provide direct evidence.** If the two most
+   related observed items are both above (or below) the model,
+   adjust in the same direction.
+
+3. **Demographic context is a sanity check.** Respondent-level
+   patterns always outweigh group averages.
+
+4. **Domain knowledge matters.** Trust in armed forces is
+   substantively different from trust in the judiciary.
+
+5. **Low confidence = your reasoning matters most.** When the model's
+   top category has $< 30\%$ probability, do not simply repeat the
+   prediction.
+
+6. **Halo effects.** If a respondent rates all observed institutions
+   consistently high or low, missing items almost certainly follow.
+
+7. **Integer output.** Predictions must be on the original scale.
+
+# The Model-Then-Adjust Paradigm
+
+## Evolution from Raw Parameters
+
+Early designs (V1) provided raw psychometric parameters: CFA
+standardized loadings, IRT discrimination and threshold tables in
+mirt format, Q3 residual correlation matrices, DIF flags from
+lordif, measurement invariance results, and theta regression
+coefficients. LLMs received no model predictions --- they were asked
+to compute predictions from these parameters.
+
+**Result:** Consistently below IRT baseline. LLMs cannot mentally
+evaluate the GRM probability function or convert discrimination
+parameters into item-level predictions.
+
+## Current Design (V2)
+
+The model-then-adjust paradigm provides the statistical model's
+conclusion as a starting point. For each masked item, the LLM
+receives:
+
+1. **Anchor prediction:** The IRT modal category (P2) or CFA
+   rounded prediction (P1).
+
+2. **Confidence signal (P2 only):** Verbal label (HIGH/MODERATE/LOW)
+   with top-2 category probabilities. Directive framing:
+   - HIGH: "model is fairly certain"
+   - MODERATE: "use residual pattern to refine"
+   - LOW: "model is uncertain, your reasoning matters most"
+
+3. **Correlated items (2 per masked item):** The two observed items
+   most correlated with the masked item (from CFA model-implied
+   correlation matrix), showing observed value, model expected value,
+   and residual with explicit directional implication:
+   - "+0.8 above $\to$ suggests this item should also be ABOVE model"
+   - "-0.5 below $\to$ suggests this item should also be BELOW model"
+
+4. **Overall residual pattern:** One-sentence prescriptive summary:
+   - "This respondent consistently rates ABOVE the model (+0.5 avg)
+     $\to$ adjust predictions UPWARD"
+
+5. **Demographic probability context (P2 only):** Per-item
+   model-based probability: "For your group, P(high trust on
+   armed\_forces) = 48\% vs. population 43\%."
+
+## What Was Dropped from V1
+
+- IRT parameter tables (discrimination $a$, thresholds $b$)
+- CFA standardized loadings and SE
+- Q3 local dependency matrix
+- Conditional expectation $E[X_M | X_O]$
+- DIF flags from lordif
+- Measurement invariance non-invariant items
+- Theta-demographic regression coefficients and $R^2$
+- Theta with SE and percentile as standalone prompt line
+- Chain-of-thought reasoning tags
+
+All dropped elements either added noise (LLMs cannot compute from
+raw parameters) or were replaced by more interpretable alternatives
+(DIF flags $\to$ demographic probability context; theta regression
+$\to$ group-level P(high trust)).
+
+# Few-Shot Examples
+
+Three training-fold exemplars per tier (P1, P2), spanning the latent
+trust spectrum. No few-shot for S tier (pure world knowledge).
+
+1. **Low trust, low residual $\to$ KEEP.** Model confidence is high
+   and the respondent's pattern is consistent with predictions.
+
+2. **Moderate trust, strong positive residual $\to$ ADJUST UP.** The
+   respondent consistently rates above the model, and uncertainty is
+   high.
+
+3. **High trust, negative residual $\to$ ADJUST DOWN.** Despite high
+   overall trust, this item's pattern suggests lower.
+
+Each example shows the complete prompt block for one respondent
+(demographics, observed items, residual summary, model prediction
+with confidence, correlated items) and the correct output line.
+Exemplars are selected from the training fold: low from the bottom
+tertile of latent scores, moderate from the middle, high from the
+top.
+
+**Reduction from 5 to 3 examples:** The original 5-exemplar design
+included "moderate residual --- small adjustment" and "extreme
+latent score --- edge case." Testing showed these two added tokens
+without improving accuracy. The three remaining examples cover the
+decision space: keep, adjust up, adjust down.
+
+# Multiple Imputation Design (m = 5)
+
+## Rationale
+
+LLM predictions at P2 are treated as multiple imputations, mirroring
+the $m = 5$ majority-vote design used for mixgb and miceRanger in
+Script 03. Each fold $\times$ tier $\times$ model combination is
+run 5 times at graduated temperatures to introduce controlled
+stochasticity:
+
+| Run | Temperature |
+|-----|-------------|
+| 1   | 0.01        |
+| 2   | 0.10        |
+| 3   | 0.20        |
+| 4   | 0.30        |
+| 5   | 0.40        |
+
+## Benefits
+
+1. **Parse failure recovery:** If a respondent fails to parse in 1
+   of 5 runs, the other 4 provide predictions.
+
+2. **Prediction stabilization:** Majority vote across 5 runs reduces
+   stochastic variance.
+
+3. **Methodological symmetry:** Both traditional and LLM methods use
+   $m = 5$ with majority vote.
+
+4. **Between-imputation variance:** Raw per-run results are saved for
+   MI variance analysis (RQ1 latent variable recovery).
+
+## Cost
+
+Approximately 5$\times$ the single-run cost. Claude Sonnet at batch
+50: $\sim$\$37 for all 5 folds $\times$ 3 tiers $\times$ 5 runs.
+Gemma and Maverick through OpenRouter are substantially cheaper.
+
+# Measurement Models
+
+## CFA (for P1)
+
+Per fold, the CFA provides factor scores from partial data via
+`lavPredict()` with FIML for missing items. Factor scores are
+expressed as percentiles and verbal labels (VERY LOW through VERY
+HIGH) relative to the training distribution.
+
+CFA predictions for masked items use the linear model:
+$\hat{X}_j = \hat{\tau}_j + \hat{\lambda}_j \hat{\eta}$, clamped
+to the scale range and rounded.
+
+CFA residuals (observed $-$ expected) for observed items provide
+the respondent-level consistency signal.
+
+## GRM/IRT (for P2)
+
+The Graded Response Model provides $\theta$ from partial data via
+`fscores()` (EAP method). For each masked item, `probtrace()`
+computes the full category probability vector, from which the modal
+category, confidence level, and top-2 probabilities are derived.
+
+IRT residuals (observed $-$ $E[X_j | \hat{\theta}]$) for observed
+items are the primary adjustment signal.
+
+For LB (descending scale), IRT reverse-coding ensures higher
+$\theta$ = higher trust. Probabilities are reversed back to the
+original scale in prompts.
+
+## Demographic Profiling (Script 02)
+
+Script 02 computes model-based probabilities per demographic group:
+$P(X_j \geq k | \bar{\theta}_{\text{group}})$ using the IRT model.
+These replace the DIF flags and theta regression from V1 with
+directly actionable probability comparisons. In the prompt:
+"For your group, P(high trust on armed\_forces) = 48\% vs. population
+43\%."
+
+## Baselines
+
+- **IRT baseline:** $\arg\max_k P(X_j = k | \hat{\theta})$ from
+  partial-data theta
+- **CFA baseline:** $\text{round}(\hat{\tau}_j + \hat{\lambda}_j
+  \hat{\eta})$ clamped to scale
+
+Both are computed from partial data and recorded alongside every
+prediction in the results tibble.
+
+# Setup
+
+```{r}
+#| label: setup
+
+library(lavaan)
+library(mirt)
+library(tidyverse)
+
+set.seed(721)
+
+code_dir    <- "D:/repos/UMD_classes_code/TSE_II_SURV721/code"
+results_dir <- "D:/repos/UMD_classes_code/TSE_II_SURV721/results"
+
+# Source item imputation prompt functions
+source(file.path(code_dir, "item_prompt_functions.R"))
+
+# Load fold data and psychometric objects
+load(file.path(results_dir, "fold_data.RData"))
+load(file.path(results_dir, "cfa_reporting.RData"))
+load(file.path(results_dir, "irt_models.RData"))
+
+cat("Loaded: folds_list, cfa_list, irt_list, masking_tbl,\n")
+cat("  cfa_params_tbl, irt_params_tbl, q3_pairs_tbl,\n")
+cat("  demo_profile_tbl, irt_models\n")
+
+# Helper: wrap long lines for PDF output
+wrap_prompt <- function(text, width = 78) {
+  lines <- str_split(text, "\n")[[1]]
+  map_chr(lines, function(line) {
+    if (nchar(line) <= width) return(line)
+    str_wrap(line, width = width, exdent = 2)
+  }) |> str_c(collapse = "\n")
+}
+```
+
+# Survey Configuration
+
+```{r}
+#| label: config
+
+config <- list(
+  lapop = list(
+    survey_label    = "a nationally representative survey conducted in Mexico in 2023",
+    demo_vars       = c("age_cat", "Edu", "Urban", "Employment"),
+    trust_items     = c(
+      "justice_system", "electoral_tribunal", "armed_forces",
+      "legislature", "public_ministry", "police", "auditor",
+      "political_parties", "supreme_court", "municipality",
+      "media", "elections"
+    ),
+    factor_names    = "Trust",
+    trust_ascending = TRUE,
+    item_scale_desc = "1 = no trust at all, 7 = a lot of trust",
+    cfa_syntax = '
+      Trust =~ justice_system + electoral_tribunal + armed_forces +
+               legislature + public_ministry + police + auditor +
+               political_parties + supreme_court + municipality +
+               media + elections
+      armed_forces ~~ legislature
+      public_ministry ~~ auditor
+    '
+  ),
+  lb = list(
+    survey_label    = "a nationally representative survey conducted in Colombia in 2023",
+    demo_vars       = c("age_cat", "Edu", "Employment"),
+    trust_items     = c(
+      "Congress", "Natl_Govt", "Judiciary", "Parties",
+      "Electoral_Inst", "President"
+    ),
+    factor_names    = "Political",
+    trust_ascending = FALSE,
+    item_scale_desc = "1 = a lot of trust, 4 = no trust at all",
+    cfa_syntax = '
+      Political =~ Congress + Natl_Govt + Judiciary + Parties +
+                   Electoral_Inst + President
+      Natl_Govt ~~ President
+    '
+  )
+)
+
+cat("LAPOP:", length(config$lapop$trust_items), "items,",
+    config$lapop$item_scale_desc, "\n")
+cat("LB:   ", length(config$lb$trust_items), "items,",
+    config$lb$item_scale_desc, "\n")
+```
+
+# System Prompt
+
+The system prompt is tier-invariant — the same persona and reasoning
+rules apply across all tiers. Only the user prompt content changes.
+
+```{r}
+#| label: system-prompt
+
+system_prompt <- build_system_prompt(config$lapop)
+cat(wrap_prompt(system_prompt))
+```
+
+\newpage
+
+# Prompt Examples
+
+## Tier S (No Model)
+
+```{r}
+#| label: example-tier-s
+
+# Pick one test respondent from LAPOP fold 1
+test_row <- folds_list$lapop |>
+  filter(fold_id == 1, split == "test") |>
+  slice(1)
+
+masked <- c("armed_forces", "legislature")
+
+info_s <- list(
+  rid          = test_row$row_id,
+  masked_items = masked
+)
+
+s_block <- build_respondent_block_s(info_s, test_row, config$lapop)
+cat(wrap_prompt(s_block))
+```
+
+\newpage
+
+# Key Design Decisions
+
+## Model-Then-Adjust vs. Predict-From-Scratch
+
+LLMs receiving the IRT prediction as an anchor consistently
+outperformed LLMs receiving only model parameters. LLMs cannot
+mentally evaluate the GRM probability function, but they can reason
+about whether to adjust a given prediction based on contextual
+signals. This is the core insight of the L2L framework:
+**translate model conclusions, not model parameters.**
+
+## Conclusions Over Parameters
+
+The V1 design included IRT discrimination tables ($a_j$, $b_{jk}$),
+CFA loadings ($\lambda_j$), Q3 matrices, DIF flags, and regression
+coefficients. LLMs treated these as noise. The V2 design replaced
+all parameters with natural language conclusions:
+
+| V1 (Parameters)             | V2 (Conclusions)                     |
+|-----------------------------|--------------------------------------|
+| $a_j = 3.30$, $b_{jk}$ table | "Model prediction: 5, Confidence: HIGH (5 at 42%, 4 at 28%)" |
+| Q3 matrix                   | "Most informative: police = 6 (+0.8 above $\to$ adjust up)" |
+| DIF flag: "media shows DIF by Edu" | "For your group, P(high trust on media) = 35% vs. population 43%" |
+| $\theta \sim \text{Edu}$: $b = -0.15$ | (Absorbed into demographic probability context) |
+| Residual: $-0.32$           | "Respondent rates BELOW model $\to$ adjust DOWNWARD" |
+
+## Prescriptive vs. Descriptive Prompts
+
+V1 prompts were descriptive: "This respondent is +0.5 above model
+expectations." V2 prompts are prescriptive: "This respondent
+consistently rates ABOVE the model (+0.5 avg) $\to$ adjust
+predictions UPWARD." Testing showed that prescriptive framing does
+not significantly improve accuracy over descriptive framing for
+Claude Sonnet, but it reduces the gap for smaller models (Gemma,
+Maverick) by making the adjustment direction explicit.
+
+## No Chain-of-Thought
+
+CoT was tested with both Maverick and Claude Sonnet under both V1
+and V2 architectures. In every configuration, CoT degraded accuracy.
+Parse rates dropped and predictions were worse. The reasoning step
+introduces noise — the LLM talks itself out of correct adjustments.
+
+## No Base Rates
+
+Base rate distributions encourage modal parroting. The IRT model
+predictions implicitly encode population-level information. Explicit
+base rates are redundant and harmful.
+
+## Three Few-Shot Examples (Reduced from Five)
+
+The five-exemplar design was reduced to three (low/moderate/high
+trust) without performance loss. The two dropped exemplars
+(moderate residual and extreme latent score) added tokens without
+covering distinct adjustment scenarios.
+
+## Batch Size
+
+Testing across sizes (1, 5, 10, 20, 25, 50) showed negligible
+accuracy differences for Claude Sonnet (range: 62.3--63.9\% on LB
+P2). Claude uses batch 50 for cost efficiency. Gemma and Maverick
+use batch 25 due to higher parse failure rates at larger sizes.
+
+## Masking Design
+
+1--4 items per respondent, randomly assigned (`sample(1:4)` count,
+`sample(items, size = k)` selection). Produces a continuous
+degradation curve. Masking table generated once in Script 02 and
+shared across all methods.
+
+## Opus 4.6 vs. Sonnet 4.6
+
+Opus was tested on one fold --- accuracy matched Sonnet at
+approximately 15$\times$ the cost. Sonnet is the production model.
+
+# Models Evaluated
+
+## LLMs
+
+- **Claude Sonnet 4.6** (Anthropic API, batch 50): Strongest LLM.
+  The only model consistently above IRT baseline at P2 on both
+  surveys.
+- **Llama 4 Maverick** (Meta, OpenRouter, batch 25): Below IRT at
+  P2 but shows the tier ordering (S $<$ P2).
+- **Gemma 3 27B** (Google, OpenRouter, batch 25): Weakest LLM.
+  Below IRT at P2 on both surveys.
+
+## Traditional Benchmarks
+
+- **mixgb** (XGBoost, $m = 5$ majority vote): Strongest traditional
+  benchmark.
+- **miceRanger** (Random forest, $m = 5$ majority vote): Below mixgb
+  on both surveys.
+
+## Parse Rates (5-Fold Production, m=5 MI)
+
+| Method  | LAPOP S | LAPOP P1 | LAPOP P2 | LB S | LB P1 | LB P2 |
+|---------|---------|----------|----------|------|-------|-------|
+| Claude  | 90.1%   | 100%     | 100%     | 86.1%| 100%  | 100%  |
+| Gemma   | 99.9%   | 96.9%    | 98.1%    | 100% | 96.1% | 98.6% |
+| Maverick| 100%    | 100%     | 100%     | 100% | 100%  | 100%  |
+
+Claude's lower S-tier parse rate reflects the absence of the model
+anchor — without a structured prediction block, Claude occasionally
+produces verbose output. P1 and P2 parse rates are 100% for Claude.
+
+# Production Results (5-Fold CV, m=5 MI)
+
+## Accuracy by Method $\times$ Tier $\times$ Survey
+
+| Method  | LAPOP S | LAPOP P1 | LAPOP P2 | LB S  | LB P1 | LB P2 |
+|---------|---------|----------|----------|-------|-------|-------|
+| Claude  | .362    | .379     | **.394** | .603  | .603  | **.614** |
+| Maverick| .366    | .371     | .367     | .595  | .581  | .592  |
+| Gemma   | .375    | .347     | .358     | .589  | .557  | .586  |
+| IRT     | ---     | ---      | .388     | ---   | ---   | .600  |
+| mixgb   | .382    | .393     | .393     | .566  | .574  | .589  |
+
+Claude P2 exceeds IRT by +0.6pp (LAPOP) and +1.4pp (LB). Claude P2
+exceeds mixgb P2 by +0.1pp (LAPOP) and +2.5pp (LB). The advantage
+is scale-dependent: larger on the 4-point LB scale.
+
+**Note:** Traditional method results at P1/P2 are reported for
+completeness but the fair comparison is LLM P1/P2 vs. traditional S,
+since trees at P1/P2 see the complete training response matrix plus
+psychometric features — an information advantage that has nothing to
+do with the L2L innovation. See Script 05 (H1c) for the fair
+comparison.
+
+## Key Findings
+
+1. **Tier ordering (H1a):** Claude shows monotonic S $<$ P1 $<$ P2
+   on both surveys. Gemma and Maverick show the ordering on some
+   but not all conditions.
+
+2. **Scale dependency:** LLM advantage is larger on the 4-point
+   scale (LB) where categorical predictions have higher base rates.
+   On the 7-point scale (LAPOP), the IRT baseline is harder to beat.
+
+3. **Model capability threshold:** Only the frontier model (Claude
+   Sonnet) consistently exceeds IRT. Gemma 27B and Maverick cannot
+   reliably extract the adjustment signal from residual patterns.
+   This is itself a finding about the reasoning capability required
+   for psychometric context engineering.
+
+4. **Parse rate $\to$ data quality:** MI replication ($m = 5$)
+   recovers from parse failures. After majority vote, effective
+   coverage is $> 98\%$ for all model $\times$ tier conditions.
+
+# Prompt Engineering Evolution
+
+1. **V1 (Raw parameters):** CFA loadings, IRT discrimination/
+   thresholds, Q3, DIF flags, MI results, theta regression, few-shot
+   reasoning chains. No model predictions as anchors. Result:
+   consistently below IRT baseline.
+
+2. **V2a (Model-then-adjust, passive):** IRT/CFA predictions as
+   anchors with "default to keeping unless clear evidence." Five
+   few-shot examples. DIF cues and conditional expectations included.
+   Result: LLMs anchored too hard --- zero marginal recovery.
+
+3. **V2b (Model-then-adjust, simplified):** Dropped all raw
+   parameters, DIF, MI, conditional expectations. Added demographic
+   probability context from Script 02. Reduced to 3 few-shot
+   examples. Result: Claude matches IRT on LAPOP, exceeds on LB.
+
+4. **V2c (Prescriptive framing):** Changed residual summaries and
+   correlated items from descriptive to prescriptive ("$\to$ adjust
+   UPWARD"). Changed system prompt from "decide whether to KEEP or
+   ADJUST" to "your job is to REFINE." Dropped the $\pm 2$ cap.
+   Result: no significant improvement for Claude, marginal
+   improvement for smaller models. Adopted as production.
+
+5. **MI replication (m = 5):** Graduated temperature schedule
+   (0.01--0.40) across 5 runs with majority vote. Matches traditional
+   MI design. Recovers parse failures and stabilizes predictions.
+
+# Limitations
+
+1. **Listwise deletion** reduces samples (LAPOP: 1,430; LB: 1,073).
+2. **ML estimation** treats ordinal items as continuous.
+3. **Survey weights not used** — evaluation is case-level.
+4. **Unidimensional IRT** — Q3 identifies local dependency but does
+   not model it.
+5. **7-point LAPOP** produces diffuse IRT distributions (max
+   $P < 0.25$), limiting the confidence signal.
+6. **CFA refit per fold** in Script 04 introduces minor variation
+   from Script 02 CFA.
+7. **Model-then-adjust** bounds accuracy near IRT — marginal recovery
+   is modest (+0.6pp LAPOP, +1.4pp LB for Claude).
+8. **Random masking (1--4)** introduces heterogeneity in latent score
+   estimation quality.
+9. **Cost constraints** — 3 LLMs $\times$ 3 tiers $\times$
+   2 surveys $\times$ 5 folds $\times$ 5 MI runs.
+10. **Batch size asymmetry** — Claude uses batch 50, others use 25.
+    Sensitivity analysis shows negligible effect of batch size on
+    accuracy.
+11. **S-tier parse rate** — Claude's lower S-tier parse rate (86--90%)
+    is a limitation that could bias S-tier results toward parseable
+    (potentially easier) cases.
+
+\newpage
+
+# Verify `item_prompt_functions.R`
+
+```{r}
+#| label: verify-functions
+
+source_path <- file.path(code_dir, "item_prompt_functions.R")
+
+if (file.exists(source_path)) {
+  tryCatch({
+    source(source_path, local = TRUE)
+    cat("Verified item_prompt_functions.R at:", source_path, "\n")
+    cat("File size:", round(file.size(source_path) / 1e3, 1), "KB\n")
+    cat("Functions loaded successfully.\n")
+  }, error = function(e) {
+    cat("ERROR sourcing:", e$message, "\n")
+  })
+} else {
+  cat("WARNING: not found at:", source_path, "\n")
+}
+```

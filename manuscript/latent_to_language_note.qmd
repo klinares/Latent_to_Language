@@ -1,0 +1,218 @@
+---
+title: "Latent to Language: Psychometric Context Engineering for LLM-Based Imputation"
+shorttitle: "Latent to Language"
+author:
+  - name: Kevin Linares
+    corresponding: true
+    email: klinares@umd.edu Code and replication materials available at https://github.com/klinares/UMD_classes_code/tree/main/TSE_II_SURV721
+    affiliations:
+      - name: University of Maryland
+        department: Joint Program in Survey Methodology
+        city: College Park
+        region: MD
+abstract: "Imputation of missing items within psychometric scales introduces measurement error on the measurement arm of the Total Survey Error framework, yet post-imputation item parameters are rarely decomposed against a complete-data baseline. We introduce the Latent-to-Language (L2L) framework, which translates psychometric model conclusions (factor scores, IRT modal predictions, confidence labels, residual patterns) into structured natural language prompts for LLM-based imputation, and apply it to the 2023 LAPOP Mexico institutional trust scale (12 items, N = 1,430) and Latinobarómetro Colombia distrust scale (6 items, N = 1,073). Under five-fold cross-validation with MCAR masking, we compare Claude Sonnet 4.6 and Llama 4 Maverick across three information tiers against tree-based benchmarks (mixgb, miceRanger) and decompose the resulting error at the item, person, and instrument levels following Biemer (2010). Both LLM and tree-based methods inflate IRT discrimination parameters in the same direction on nearly every item, with small absolute magnitudes but structurally different compositions: Claude P2 error is 86 to 89 percent systematic, while mixgb error is 33 to 75 percent systematic. Construct ordering is preserved across methods (r > .92). These complementary error profiles position psychometric context engineering as a layer that enhances existing multiple imputation workflows through model stacking, not as a competing method."
+keywords: [total survey error, item nonresponse, multiple imputation, large language models, item response theory, measurement error]
+bibliography: references_note.bib
+format:
+  apaquarto-pdf:
+    documentmode: man
+    keep-tex: false
+    floatsintext: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(viridis)
+library(knitr)
+
+set.seed(721)
+
+data_dir <- "D:/repos/UMD_classes_code/TSE_II_SURV721/results"
+
+# ── Load the single object Figure 2 depends on ───────────────
+# rq3_delta_a contains per-item per-fold discrimination shifts
+# for Claude P2, mixgb S, and listwise deletion.
+load(file.path(data_dir, "evaluation_rq.RData"))
+
+# ── tidyverse loaded last ────────────────────────────────────
+library(tidyverse)
+```
+
+# Introduction
+
+The Total Survey Error (TSE) framework decomposes survey quality into errors of representation and errors of measurement, with measurement error accumulating through the data lifecycle from questionnaire design to post-survey processing [@groves2004; @biemer2003; @groves2010]. Item nonresponse within psychometric scales creates a processing-stage decision with direct measurement consequences. Researchers either delete incomplete cases, which degrades the measurement model through reduced estimation samples, or impute the missing values, which introduces both systematic and random error in the imputed responses [@biemer2010; @brick1996; @west2016]. The systematic component distorts the latent construct; the random component inflates variance around the true value. Post-imputation item parameters are rarely compared against a complete-data baseline, so the instrument-level consequences of routine imputation decisions remain undocumented.
+
+Traditional multiple imputation methods, including chained equations and tree-based ensembles, rely on empirical covariance among observed variables [@little2002; @rubin1986; @vanbuuren2011]. When item nonresponse occurs within a multiple-item scale, the remaining observed items carry latent information that traditional methods exploit only through pairwise correlations, ignoring the psychometric structure of the measurement model. Large Language Models (LLMs) take a different route. Transformer-based architectures process response patterns as semantic sequences and can consume external information as natural language rather than as numeric features [@vaswani2017; @minaee2024]. Early LLM applications in survey research focused on generating synthetic respondents through silicon sampling [@argyle2023], with subsequent work documenting contextual biases [@vonderheyde2025] and evaluating fine-tuning as mitigation [@holtdirk2024]. The imputation task differs from silicon sampling. Rather than simulating a population, LLM-based imputation must anchor its reasoning in a specific respondent's existing latent trait. Psychometric model estimates, routinely computed but rarely integrated into imputation pipelines, are a natural source of respondent-anchored auxiliary information.
+
+In this paper, we introduce the Latent-to-Language (L2L) framework, which translates Confirmatory Factor Analysis (CFA) and Item Response Theory (IRT) model conclusions into structured natural language prompts for LLM-based imputation [@brown2015; @samejima1969]. Three analytic questions organize the evaluation. At the item level, do LLMs benefit from psychometric context, and how does performance degrade as more items within a scale go missing? At the person level, are respondents' positions on the latent construct preserved after imputation? At the instrument level, does imputation distort the measurement model itself, and do LLM-based and tree-based methods introduce structurally different error profiles? We find that discrimination inflation is universal to item imputation, that LLM-based and tree-based methods produce structurally complementary error compositions, and that L2L is best understood as a psychometric context layer that enhances existing multiple imputation workflows rather than a competing method.
+
+# Method
+
+## Data and Participants
+
+Data are drawn from two nationally representative face-to-face surveys of voting-age adults in Latin America. The LAPOP AmericasBarometer 2023 Mexico module [@lapop2023] employs a multi-stage stratified probability design with the 2020 Population Census as the sampling frame, with interviews conducted between January and August 2023. The Latinobarómetro 2023 Colombia module [@latinobarometro2023] uses a similar multi-stage design stratified by region, municipality size, and urban/rural area. After listwise deletion on trust items and four demographic covariates (gender, age group, education, urban/rural designation), the analytic samples are $N = 1{,}430$ for Mexico and $N = 1{,}073$ for Colombia. Survey weights are not applied because the imputation task evaluates individual-level prediction accuracy rather than population-level inference.
+
+## Measures
+
+The LAPOP Mexico module includes a 12-item institutional trust scale (1 = not at all, 7 = a lot) covering the justice system, electoral tribunal, armed forces, legislature, public ministry, police, auditor, political parties, supreme court, municipality, media, and elections; higher scores indicate greater trust. The Latinobarómetro Colombia module includes a 6-item institutional distrust scale (1 = a lot, 4 = none at all) covering Congress, national government, judiciary, political parties, electoral institution, and the President. The distrust framing is preserved throughout; IRT models reverse-code items internally so that higher latent trait corresponds to higher trust on both surveys. To evaluate imputation against ground truth, we simulate within-scale item nonresponse by randomly masking one to four items per test respondent under a missing completely at random (MCAR) mechanism. The masking table is generated once and shared across methods, ensuring identical missing-data configurations for every comparison.
+
+## Psychometric Models
+
+Exploratory factor analysis using polychoric correlations and parallel analysis confirmed unidimensional structure for both scales. CFA was fitted with maximum likelihood in lavaan [@rosseel2012; @brown2015], with freed residual covariances where modification indices indicated shared method variance. The IRT Graded Response Model [@samejima1969] was fitted using the mirt package [@chalmers2012]; for Latinobarómetro, items were reverse-coded before fitting so that higher latent trait corresponds to higher trust. The GRM yields item discrimination, threshold parameters, and respondent latent trait estimates via expected a posteriori scoring. Model fit statistics and item parameters are available in the replication repository.
+
+## Information Tier Design
+
+Three tiers communicate progressively richer psychometric information through natural language (Figure 1). Tier S provides only demographics and observed items with verbal response labels; masked items are marked [MISSING]. Tier P1 adds the CFA factor score as a percentile, a per-item CFA prediction anchor, and the two most correlated observed items with their residual pattern. Tier P2 adds the IRT modal category, a HIGH, MODERATE, or LOW confidence label, top-two category probabilities, and the conditional probability of high trust given demographic group. Prompts communicate model conclusions rather than raw parameters; early designs providing loadings, discrimination values, and thresholds underperformed the IRT baseline. The production design follows a model-then-adjust paradigm in which the LLM refines the psychometric prediction using residual and contextual cues, with five few-shot exemplars demonstrating when to retain versus adjust. The system prompt casts the LLM as a psychometrician refining predictions. Full prompt text is in the replication repository. Traditional methods receive the CFA factor score (P1) and IRT latent trait (P2) as numeric features; because traditional methods at P1 and P2 also have access to the complete training response matrix, the methodologically fair comparison is between LLM tiers and traditional methods at S.
+
+```{r}
+#| label: fig-tier-design
+#| fig-cap: "Each tier includes all information from lower tiers. LLM tiers communicate psychometric conclusions as natural language."
+#| fig-width: 9
+#| fig-height: 5
+
+tier_boxes <- tibble(
+  tier = factor(c("S", "P1", "P2"), levels = c("S", "P1", "P2")),
+  xmin = c(0, 4.2, 8.4),
+  xmax = c(3.8, 8, 12.2),
+  ymin = 0, ymax = 3,
+  label = c(
+    "Tier S\n\nDemographics\nObserved items\n(verbal labels)\nMasked items = [MISSING]",
+    "Tier P1: + CFA\n\nFactor score (percentile)\nCFA prediction anchor\n2 correlated items\nResidual pattern",
+    "Tier P2: + IRT\n\nIRT modal prediction\nConfidence (HIGH/MOD/LOW)\nTop-2 probabilities\n2 correlated items\nP(high trust | group)"
+  )
+)
+
+ggplot(tier_boxes) +
+  geom_rect(aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax,
+                fill = tier),
+            color = "white", linewidth = 1) +
+  geom_text(aes(x = (xmin + xmax) / 2, y = 1.5, label = label),
+            size = 4.5, color = "black", fontface = "bold",
+            lineheight = 0.9) +
+  annotate("segment", x = 3.8, xend = 4.2, y = 1.5, yend = 1.5,
+           arrow = arrow(length = unit(0.2, "cm"), type = "closed"),
+           color = "grey30", linewidth = 0.8) +
+  annotate("segment", x = 8, xend = 8.4, y = 1.5, yend = 1.5,
+           arrow = arrow(length = unit(0.2, "cm"), type = "closed"),
+           color = "grey30", linewidth = 0.8) +
+  annotate("text", x = 6.1, y = -0.4,
+           label = "Increasing psychometric context →",
+           size = 4.5, color = "grey40", fontface = "italic") +
+  scale_fill_viridis_d(option = "D", begin = 0.3, end = 0.85,
+                       guide = "none", alpha = .7) +
+  scale_x_continuous(limits = c(-0.3, 12.5), expand = c(0, 0)) +
+  scale_y_continuous(limits = c(-0.7, 3.5), expand = c(0, 0)) +
+  theme_void(base_size = 12)
+```
+
+## Imputation Models
+
+We deploy Claude Sonnet 4.6 (Anthropic API, batch size 50) and Llama 4 Maverick (OpenRouter, batch size 25) for LLM-based imputation, called via ellmer [@wickham2025]. Two tree-based benchmarks serve as comparisons: mixgb [@chen2016] and miceRanger [@wright2017]. All methods generate $m = 5$ imputations with majority-vote consensus; LLMs run at graduated temperatures (0.01, 0.10, 0.20, 0.30, 0.40) to introduce controlled stochasticity.
+
+## Evaluation
+
+Each survey is partitioned into five folds with training and test splits. Psychometric models are fit to training data only, and the resulting parameters feed into the LLM prompts, preventing information leakage. Random masking of one to four items per test respondent is shared across all methods. For each fold, we refit the measurement models under three conditions: gold standard on complete data, listwise deletion on training only, and imputed where predicted values replace masked items and are treated as observed. Three metrics target different analytic levels. Item-level prediction accuracy is evaluated using quadratic weighted kappa [@cohen1968]. Person-level construct recovery is evaluated via the Pearson correlation and regression slope between ground-truth and imputed IRT latent trait estimates. Instrument-level distortion is evaluated by extracting the per-item per-fold discrimination shift and decomposing mean squared error into systematic (squared bias) and random (variance) components following @biemer2010.
+
+# Results
+
+At the item level, Claude Sonnet improves monotonically across information tiers on both surveys. Weighted kappa rises from $W\kappa$ = .645 at Tier S to .667 at P1 and .675 at P2 on the LAPOP 12-item scale, and from .550 to .559 to .579 on the Latinobarómetro 6-item scale. At the fair Tier S comparison, Claude Sonnet ($W\kappa$ = .645 LAPOP, .550 LB) outperforms mixgb (.615, .463) and miceRanger (.561, .504); Maverick shows a similar but weaker upward trajectory. Differences between low and high masking intensity are more diagnostic than pooled accuracy. On LAPOP, all methods hold stable under heavy masking because the 12-item scale retains enough observed items to anchor predictions. On Latinobarómetro, where masking three or four of six items leaves only two or three observed responses, the methods diverge: Claude Sonnet at P2 declines modestly from $W\kappa$ = .612 to .567, while mixgb at S drops from .604 to .399, a 34 percent degradation. Psychometric context helps most where imputation is hardest, namely short scales under heavy item nonresponse. We carry Claude P2 forward as the L2L representative and mixgb S as the traditional benchmark for the person- and instrument-level analyses.
+
+At the person level, all methods preserve the rank ordering of respondents on the latent construct with high fidelity. On the LAPOP 12-item scale, correlations between ground-truth and imputed latent trait estimates exceed $r$ = .98 for every method at every tier, with Claude Sonnet reaching $r$ = .989 at S and .988 at P2. On the shorter Latinobarómetro 6-item scale, correlations are lower but still strong. Claude Sonnet ranges from $r$ = .930 at S to .924 at P2, outperforming mixgb S ($r$ = .895) by a meaningful margin. The regression slope shows where person-level distortion concentrates. Claude P2 produces slopes of 1.03 on LAPOP and 1.01 on Latinobarómetro, indicating near-perfect scale fidelity. Mixgb S shows a slope of 1.01 on LAPOP but 0.89 on Latinobarómetro, indicating 11 percent centripetal compression of the latent distribution on the shorter scale. Mixgb correctly orders respondents but systematically underestimates distance between high-trust and low-trust individuals on the 4-point scale. Claude P2 avoids this compression.
+
+At the instrument level, we refit the IRT-GRM on four conditions per fold (gold, deletion, Claude P2, mixgb S), extract item discrimination parameters, compute the per-item per-fold shift relative to gold, and decompose the resulting mean squared error into squared-bias (systematic) and variance (random) components. Both methods inflate item discrimination relative to gold on nearly every item. On LAPOP, mean discrimination shift is +0.09 for Claude P2 and +0.05 for mixgb S; on Latinobarómetro, +0.20 and +0.05 respectively. The universal positive direction indicates that discrimination inflation is an inherent consequence of item imputation: any method that produces responses more consistent with the latent factor than the original responses will tighten inter-item covariance and inflate discrimination. The absolute magnitudes are small, under 5 percent relative distortion on LAPOP, but error composition differs structurally (Figure 2).
+
+```{r}
+#| label: fig-biemer
+#| fig-cap: "Claude P2 distortion is predominantly systematic (solid) while mixgb S shows more random error (gap between solid and faded). Full bar = total MSE; solid portion = squared bias. Labels show total MSE and percent systematic."
+#| fig-width: 8
+#| fig-height: 8
+#| fig-pos: "H"
+
+# ── Recompute Biemer decomposition from rq3_delta_a with ──────
+# population variance (/ n) so that Bias² + Variance = MSE exactly
+biemer_both <- rq3_delta_a |>
+  pivot_longer(cols = c(delta_claude, delta_mixgb),
+               names_to = "config",
+               values_to = "delta") |>
+  mutate(config = recode(config,
+    delta_claude = "Claude P2",
+    delta_mixgb  = "mixgb S")) |>
+  group_by(survey_label, item, config) |>
+  summarise(
+    bias_sq  = mean(delta)^2,
+    variance = sum((delta - mean(delta))^2) / n(),
+    mse      = mean(delta^2),
+    pct_syst = round(
+      if_else(mean(delta^2) > 0,
+              mean(delta)^2 / mean(delta^2) * 100, 0), 0),
+    .groups  = "drop"
+  )
+
+# ── Gold a used to order items on the y-axis ──────────────────
+item_order <- rq3_delta_a |>
+  group_by(survey_label, item) |>
+  summarise(gold_a = mean(Gold), .groups = "drop")
+
+biemer_both <- biemer_both |>
+  left_join(item_order, by = c("survey_label", "item")) |>
+  mutate(
+    config = factor(config,
+      levels = c("mixgb S", "Claude P2")),
+    label  = paste0(sprintf("%.3f", mse), " (", pct_syst, "%)")
+  )
+
+ggplot(biemer_both,
+       aes(y = reorder(item, gold_a))) +
+  # Faded bar: total MSE
+  geom_col(aes(x = mse, fill = config),
+           width = 0.6,
+           position = position_dodge(0.7),
+           alpha = 0.3) +
+  # Solid bar: Bias² (systematic portion)
+  geom_col(aes(x = bias_sq, fill = config),
+           width = 0.6,
+           position = position_dodge(0.7)) +
+  # Labels for total MSE and percent systematic
+  geom_text(
+    aes(x = mse, label = label, group = config),
+    position = position_dodge(0.7),
+    hjust = -0.05, size = 3
+  ) +
+  facet_wrap(~ survey_label, scales = "free", ncol = 1) +
+  scale_fill_manual(
+    values = c("mixgb S"   = viridis(4, option = "C")[1],
+               "Claude P2" = viridis(4, option = "C")[3]),
+    name = NULL
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.8))) +
+  labs(x = "MSE of Discrimination (a)",
+       y = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(
+    strip.text = element_text(face = "bold", size = 12),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(size = 11)
+  )
+```
+
+Claude P2 distortion is predominantly systematic, with 89 percent of total MSE on LAPOP and 86 percent on Latinobarómetro attributable to squared bias. Mixgb S shows a more balanced profile (75 percent and 33 percent). Listwise deletion introduces near-zero bias but substantial variance from sample reduction. On LAPOP, Claude P2 inflation scales with item discrimination: the highest-discriminating items (justice_system, auditor) carry roughly double the inflation of the lowest. Claude P2 also preserves item-level response variance better than mixgb S on Latinobarómetro, where mixgb shrinks variance by 2 to 3 percent on most items versus approximately 1.5 percent for Claude; on LAPOP, shrinkage is comparable (mean around $-0.5$ percent). More discrimination bias but less variance shrinkage suggests the two methods introduce instrument-level distortion through different mechanisms.
+
+# Discussion
+
+Our first finding is that discrimination inflation is not unique to LLM-based imputation. Both Claude P2 and mixgb S inflated discrimination in the same direction on nearly every item. Any researcher who imputes missing scale items and refits a measurement model obtains item parameters that overstate how sharply the instrument differentiates between respondents. Within the TSE framework, this is systematic measurement error introduced at the imputation stage, rarely examined because few researchers compare post-imputation parameters against a complete-data baseline [@biemer2010]. Whether the distortion matters in practice depends on the intended analysis. In absolute terms, the inflation is small enough that substantive conclusions drawn from scale scores would not change. What differs is the error composition. The LLM's error is predominantly systematic, predictable and directional, and in principle correctable through post-hoc adjustment. The tree ensemble's error splits more evenly between systematic and random components, which is harder to characterize. Researchers who prioritize parameter stability across replications may prefer the LLM's predictable profile despite higher total MSE, while those who prioritize unbiasedness may prefer the tree ensemble's lower systematic component. The relevant question is which error structure is more tolerable for the intended analysis.
+
+The second finding follows from these complementary error profiles. We initially designed this study as a head-to-head comparison between L2L and traditional multiple imputation, evaluating Claude P2 against mixgb S under matched conditions. The Biemer decomposition results do not support that framing. Claude P2 contributes systematic discrimination inflation with preserved item variance, while mixgb S contributes more balanced error but greater variance shrinkage. The two methods introduce error through different mechanisms that partially offset. A more productive framing treats psychometric context engineering as a layer that sits on top of existing imputation pipelines. Rubin's framework [@rubin1986] captures model uncertainty through between-imputation variance, and combining structurally different imputation engines would broaden this coverage. If the systematic biases of the two methods partially offset in a pooled ensemble, stacking could yield lower total distortion than either method alone. We noticed a mechanism for why LLM error is so heavily systematic while developing the prompts, which we describe as an anchoring-flexibility tradeoff. Softer anchors (CFA percentiles, directional cues) preserve LLM reasoning and produce balanced error, while precise anchors (IRT probability distributions) compress the LLM's reasoning toward rounding the starting prediction to the nearest integer. Precise anchors produce more accurate item predictions but more systematic instrument-level distortion. The production P2 prompt architecture deliberately over-anchored to maximize item accuracy.
+
+The third finding concerns a source of error unique to LLM-based imputation. LLMs carry semantic priors from their training corpus that can conflict with population-specific attitudes. The armed forces item on the LAPOP scale showed the largest negative signed error at high response categories, indicating that when Mexican respondents reported high trust in the armed forces, the LLM systematically underpredicted. This pattern is consistent with training-corpus coverage of Latin American militaries that runs more negative than the institutional trust this population actually reports. Prior-attitude interference is a form of systematic measurement error that has no analog in traditional imputation. Item-level signed-error diagnostics should therefore be standard practice before deploying L2L in production, particularly in cross-national research where the same institution may carry different connotations across populations.
+
+Several design choices constrain generalizability. Items were masked under MCAR, an optimistic scenario relative to real item nonresponse patterns, which are typically MAR or MNAR. Maximum likelihood estimation treats ordinal categories as continuous. IRT specifications are unidimensional; multidimensional constructs would require richer prompt architectures. Evaluation is limited to institutional trust scales in two Latin American populations, and the extension to other construct domains, cultures, and languages remains untested. The immediate next step is to test model stacking empirically: pooling multiple imputation datasets from tree-based methods with an LLM that integrates psychometric conclusions and traditional imputation predictions into a final imputed value.
+
+\newpage
+
+# References

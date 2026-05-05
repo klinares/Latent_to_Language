@@ -1,0 +1,739 @@
+---
+title: "L2L Framework: Data Preparation"
+subtitle: "LAPOP Mexico 2023 & Latinobarómetro Colombia 2023"
+author: "Kevin Linares (JPSM, University of Maryland)"
+date: today
+format:
+  pdf:
+    documentclass: article
+    geometry: margin=1in
+execute:
+  echo: true
+  warning: true
+  message: false
+---
+
+```{r setup}
+pacman::p_load(sjlabelled, psych, knitr, 
+               viridis, patchwork, lavaan, semTools, tidyverse)
+
+set.seed(721)
+
+results_dir <- "D:/repos/UMD_classes_code/TSE_II_SURV721/results"
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Overview
+
+This script prepares two survey datasets for the Latent-to-Language (L2L) framework:
+
+-   **LAPOP Mexico 2023** — AmericasBarometer, 18-item trust/system support battery
+-   **Latinobarómetro Colombia 2023** — 9-item institutional trust battery
+
+For each survey, we:
+
+-   \(1\) load raw data
+
+-   \(2\) inspect value labels to understand coding
+
+-   \(3\) select and recode variables
+
+-   \(4\) assess missingness and drop high-missing demographics
+
+-   \(5\) apply listwise deletion
+
+-   \(6\) validate the final dataset.
+
+# LAPOP Mexico 2023
+
+## Load and Inspect
+
+```{r lapop-load}
+lapop_raw <- read_spss(
+  "D:/repos/UMD_classes_code/TSE_II_SURV721/lapop/MEX_2023_LAPOP_AmericasBarometer_v1.0_w.sav") |>
+  tibble()
+
+```
+
+### Trust items "Trust in"
+
+Coded as 1 = Not at all, . . ., 7 = a lot.
+
+```{r lapop-trust-inspect}
+trust_items <- c("b10a", "b11", "b12", "b13", "b15",
+                 "b18", "b19", "b21", "b21a", "b31",
+                 "b32", "b37", "b47a")
+
+
+lapop_trust_names <- c(
+  justice_system = "b10a",
+  electoral_tribunal = "b11",
+  armed_forces = "b12",
+  legislature = "b13",
+  public_ministry = "b15",
+  police = "b18",
+  auditor = "b19",
+  political_parties = "b21",
+  president = "b21a",
+  supreme_court = "b31",
+  municipality = "b32",
+  media = "b37",
+  elections = "b47a"
+)
+
+
+lapop_raw |>
+  select(all_of(trust_items)) |>
+  rename(!!!lapop_trust_names) |> 
+  drop_na() |> 
+  pivot_longer(everything(), names_to = "item", values_to = "value") |>
+  count(item, value) |>
+  ggplot(aes(x = item, y = n, fill = factor(value))) +
+  geom_col(position = "fill") +
+  scale_fill_viridis_d() +
+  labs(x = NULL, y = "Proportion", fill = "Response") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+Trust items
+
+### Outcome Variables
+
+```{r lapop-outcome-inspect}
+
+lapop_raw |>
+  select(pn4, m1) |>
+  mutate_all(sjlabelled::as_character) |>
+  pivot_longer(everything(), 
+               names_to = "Outcome", values_to = "Response") |> 
+  drop_na() |> 
+  group_by(Outcome, Response) |> 
+  count() |>
+  group_by(Outcome) |>
+  mutate(pct = n / sum(n) * 100) |>
+  ggplot(aes(x = Response, y = pct, fill = Response)) +
+  geom_col() +
+  geom_text(aes(label = sprintf("%.1f%%", pct)), vjust = -0.5) +
+  facet_wrap(~Outcome, scales = "free_x") +
+  labs(y = "Percentage", x = NULL) +
+  scale_fill_viridis_d() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+### M1 is presidential rating. The following are the labels translated from Spanish.
+
+-   1 = Very good
+
+-   2 = Good
+
+-   3 = Neighter good nor bad
+
+-   4 = Bad
+
+-   5 = Very Bad
+
+### pn4 is satisfaction with democracy
+
+-   1 = Very satisfied
+
+-   2 = satisfied
+
+-   3 = dissatisfied
+
+-   4 = very dissatisfied
+
+## Recode data
+
+```{r lapop-trust-recode}
+# demographics 
+lapop_demo_source <- c("q1tc_r", "q2", "edre", "ur", "ocup4a")
+
+lapop <- lapop_raw |>
+  select(all_of(c(trust_items, lapop_demo_source, "pn4", "m1"))) |>
+  rename(!!!lapop_trust_names) |> 
+  mutate(across(all_of(setdiff(lapop_demo_source, "q2")), as_character)) |>   
+  # rename variables & recode values to english
+  mutate(
+    # bin age
+     age_cat = cut(q2,
+                  breaks = c(17, 29, 44, 59, Inf),
+                  labels = c("18-29", "30-44", "45-59", "60+"),
+                  right = TRUE),
+     
+    # recode gender to factor with female as reference group
+    sex = ifelse(q1tc_r == "Mujer/femenino", "Female", "Male"),
+    male = factor(sex),
+    
+    # recode education
+    Edu = case_when(
+      edre == "Ninguna" ~ "none",
+      edre == "Primaria incompleta" ~ "primary",
+      edre == "Primaria completa" ~ "primary",
+      edre == 
+        "Secundaria o Educación Media Superior/Bachillerato/Preparatoria/Profesional Técnico incompleta" ~ "secondary",
+      edre == 
+        "Secundaria o Educación Media Superior/Bachillerato/Preparatoria/Profesional Técnico completa" ~ "secondary",
+      edre == 
+        "Universitaria, superior no universitaria o técnico universitario completa" ~ "higher_ed",
+      edre == 
+        "Universitaria, superior no universitaria o técnico universitario incompleta" ~ "higher_ed",
+      TRUE ~ NA_character_
+    ),
+    Edu = factor(Edu, 
+                 levels = c("none", "primary", "secondary", "higher_ed")),
+    
+    # urban factor
+    Urban = factor(ifelse(ur=="Urbano", "urban", "rural")),
+    
+    # recode occupation status
+    Employment = case_when(
+      ocup4a == "Trabajando?" ~ "Employed",
+      ocup4a == "No está trabajando en este momento pero tiene trabajo?" 
+      ~ "Employed",
+      ocup4a == "Se dedica a los quehaceres de su hogar?" ~ "house_wife",
+      ocup4a == "Es estudiante?" ~ "Student",
+      ocup4a == 
+        "Está jubilado, pensionado o incapacitado permanentemente para trabajar?" ~ "Retired",
+      ocup4a == "Está buscando trabajo activamente?" ~ "Unemployed",
+      ocup4a == "No trabaja y no está buscando trabajo?" ~ "Unemployed",
+      TRUE ~ NA_character_),
+    Employment = factor(Employment),
+    
+    # recode outcomes
+    satis_demo_lapop = pn4,
+    prez_rating = m1
+    ) |> 
+  # listwise deletion
+  drop_na() |> 
+  # drop variables we no longer need
+  select(!all_of(lapop_demo_source), -sex, -pn4, -m1)
+
+lapop |> glimpse()
+
+
+map(1:ncol(lapop), function(C) { 
+  col_name <- names(lapop)[C]
+  lapop |> select(all_of(C)) |> rename(Var=1) |> count(Var) |> mutate(column = col_name, .before = 1) |> 
+    kable()
+})
+
+```
+
+# We are left with n=1,430
+
+### 
+
+## 
+
+## 
+
+\newpage
+
+# Latinobarometro Colombia 2023
+
+## Load data
+
+```{r}
+lb_raw <- read_rds(
+  "D:/repos/UMD_classes_code/TSE_II_SURV721/latinobarrometer/Latinobarometro_2023_Esp_Rds_v1_0.rds") |>
+  tibble() |>
+  # keep only Colombia
+  filter(idenpa == 170)
+```
+
+### Trust Battery (9 items) and responses translated to English.
+
+-   -5 through -1 = NA
+
+-   1 = A lot of trust
+
+-   2 = some trust
+
+-   3 = little trust
+
+-   4 = no trust
+
+```{r}
+trust_vars_raw <- c("P13STGBS_A", "P13STGBS_B", "P13ST_C",
+                     "P13ST_D", "P13ST_E", "P13ST_F",
+                     "P13ST_G", "P13ST_H", "P13ST_I")
+
+lb_trust_names <- c(Armed_forces = "P13STGBS_A",
+                    Police = "P13STGBS_B", 
+                    Church = "P13ST_C",
+                    Congress = "P13ST_D", 
+                    Natl_Govt = "P13ST_E", 
+                    Judiciary = "P13ST_F",
+                    Parties = "P13ST_G",
+                    Electoral_Inst = "P13ST_H", 
+                    President = "P13ST_I")
+
+
+lb_raw |>
+  select(all_of(trust_vars_raw)) |>
+  rename(!!!lb_trust_names) |>
+  mutate(across(everything(), ~ifelse(. %in% -5:-1, NA, .))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |>
+  drop_na(value) |>
+  count(variable, value) |>
+  group_by(variable) |>
+  mutate(prop = n / sum(n)) |>
+  ggplot(aes(x = variable, y = prop, fill = factor(value))) +
+  geom_col() +
+  scale_fill_viridis_d() +
+  labs(x = "Variable", y = "Proportion", fill = "Response") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+### Outcome Variables
+
+### P11STGBS_A Satisfaction with Democracy codings translated into English.
+
+-   -5 through -1 = NA
+
+-   1 = Very Satisfied
+
+-   2 = Quite Satisfied
+
+-   3 = Not very satisfied
+
+-   4 = not at all satisfied
+
+### P12ST country governed by a few powerful groups, or governed for the good at all codings translated into English
+
+-   -5 through -1 = NA
+
+-   1 = powerful groups in their interest
+
+-   2= for the good of all
+
+```{r}
+
+lb_raw |> 
+  select(P11STGBS_A, P12ST) |> 
+  mutate(across(everything(), ~if_else(. < 0, NA_real_, .))) |> 
+  mutate(across(everything(), factor)) |> 
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |> 
+  ggplot(aes(x = value)) +
+  geom_bar(aes(fill = variable), show.legend = FALSE) +
+  facet_wrap(~variable, scales = "free") +
+  scale_fill_viridis_d() +
+  theme_minimal()
+
+
+```
+
+### 
+
+### 
+
+## Recode data
+
+```{r}
+
+# demographics 
+lb_demo_source <- c("sexo", "edad",
+                     "REEEDUC_1", "tamciud", "S18_A")
+
+lb <- lb_raw |> 
+  select(all_of(trust_vars_raw), all_of(lb_demo_source), P11STGBS_A, P12ST) |> 
+  rename(!!!lb_trust_names) |>
+  mutate(across(all_of(setdiff(lb_demo_source, "edad")), as_character)) |> 
+  
+  # remove missing data
+  mutate(across(everything(), ~ifelse(. %in% -5:-1, NA, .)),
+         
+         # recode demographics
+          male = factor(
+            ifelse(sexo == "Hombre", "Male", "Female")),
+         
+         # bin age
+         age_cat = cut(edad,
+                  breaks = c(17, 29, 44, 59, Inf),
+                  labels = c("18-29", "30-44", "45-59", "60+"),
+                  right = TRUE),
+         
+         # recode education
+    Edu = case_when(
+      REEEDUC_1 == "Analfabeto" ~ "none",
+      REEEDUC_1 == "Basica incompleta" ~ "primary",
+      REEEDUC_1 == "Basica completa" ~ "primary",
+      REEEDUC_1 =="Secundaria, media, tecnica completa" ~ "secondary",
+      REEEDUC_1 == "Secundaria, media, tecnica incompleta" ~ "secondary",
+      REEEDUC_1 == "Superior completa" ~ "higher_ed",
+      REEEDUC_1 == "Superior Incompleta" ~ "higher_ed",
+      TRUE ~ NA_character_
+    ),
+    Edu = factor(Edu, 
+                 levels = c("none", "primary", "secondary", "higher_ed")),
+         
+    # urban factor
+    Urban = case_when(
+      tamciud == "(Capital)" ~ "urban",
+      tamciud == "100.001 y mas" ~ "urban",
+      tamciud == "50.001 - 100.000" ~ "urban",
+      tamciud == "40.001 - 50.000" ~ "urban",
+      tamciud == "20.001 - 40.000" ~ "rural",
+      tamciud == "10.001 - 20.000" ~ "rural",
+      tamciud == "5.001 - 10.000" ~ "rural",
+      tamciud == "Menos de 5.000" ~ "rural",
+      TRUE ~ NA_character_
+    ),
+    
+    Urban = factor(Urban, levels = c("rural", "urban")),
+    
+    # recode occupation status
+    Employment = case_when(
+      S18_A == "Independiente/cuenta propia" ~ "Employed",
+      S18_A == "Asalariado en emp. privada" ~ "Employed",
+      S18_A == "Asalariado en emp. publica" ~ "Employed",
+      S18_A == 
+        "No trabaja/ responsable de las compras y el cuidado de la casa" ~
+        "house_wife",
+      S18_A == "Estudiante" ~ "Student",
+      S18_A ==  "Retirado/pensionado" ~ "Retired",
+      S18_A == "Temporalmente no trabaja" ~ "Unemployed",
+      TRUE ~ NA_character_),
+    Employment = factor(Employment),
+    
+    # recode outcomes
+    satis_demo_lb = P11STGBS_A,
+    governed_for = P12ST
+    ) |> 
+
+  # listwise deletion
+  drop_na() |> 
+  
+  # drop variables we no longer need
+  select(!all_of(lb_demo_source), -P11STGBS_A, -P12ST)
+
+lb |> glimpse()
+
+
+map(1:ncol(lb), function(C) { 
+  col_name <- names(lb)[C]
+  lb |> select(all_of(C)) |> rename(Var=1) |> count(Var) |> mutate(column = col_name, .before = 1) |> 
+    kable()
+})
+
+```
+
+# We are left with n=1,073
+
+## 
+
+\newpage
+
+## We now move to exploratory factor analysis for each survey trust items.
+
+### Lapop EFA with one-three factors
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# Exploratory Factor Analysis — Reusable Function
+# ══════════════════════════════════════════════════════════════════════════════
+
+run_efa <- function(items_df, max_factors = 3, seed = 721) {
+
+  # Coerce to numeric, drop incomplete cases
+  items_df <- items_df |> drop_na() |> mutate(across(everything(), as.numeric))
+  cat(sprintf("EFA: %d cases, %d items\n\n", nrow(items_df), ncol(items_df)))
+
+  # Polychoric correlations — appropriate for ordinal items
+  R <- polychoric(items_df)$rho
+
+  # Parallel analysis — compare observed eigenvalues to simulated null
+  set.seed(seed)
+  pa <- fa.parallel(R, n.obs = nrow(items_df), fa = "fa", cor = "cor",
+                    plot = TRUE, main = "Parallel Analysis")
+
+  # Fit 1 through max_factors — oblimin rotation for correlated factors
+  models <- map(1:max_factors, \(nf) {
+    fa(R, nfactors = nf, n.obs = nrow(items_df),
+       rotate = if (nf == 1) "none" else "oblimin",
+       fm = "wls", cor = "cor")
+  }) |> set_names(paste0("f", 1:max_factors))
+
+  # Comparison table — TLI, RMSEA, BIC for model selection
+  comparison <- imap_dfr(models, \(mod, name) {
+    tibble(model = name, factors = mod$factors,
+           TLI = mod$TLI, RMSEA = mod$RMSEA[1],
+           BIC = mod$BIC,
+           prop_var = sum(mod$Vaccounted["Proportion Var", ]))
+  })
+  cat("\n"); print(comparison, width = Inf)
+
+  # Print sorted loadings (cutoff = 0.3) for each solution
+  walk(models, \(mod) {
+    cat(sprintf("\n-- %d-factor loadings --\n", mod$factors))
+    print(mod$loadings, cutoff = 0.3, sort = TRUE)
+  })
+
+  # Return key objects for downstream CFA specification
+  invisible(list(polychoric = R, parallel = pa, models = models,
+                 comparison = comparison, n_suggested = pa$nfact))
+}
+```
+
+```{r}
+lapop_trust <- run_efa(lapop |> select(justice_system:elections), max_factors = 3)
+```
+
+-   We find that a one factor solution is feasible but has a poor fit indicated by TLI and RMSEA. It seems that trust in the president might be a problematic item.
+
+### We now conduct a CFA one and two factor model on the lapop trust items
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# CFA — 1-Factor and 2-Factor Models (LAPOP Mexico Trust Items)
+# ══════════════════════════════════════════════════════════════════════════════
+
+set.seed(721)
+
+diagnose_cfa <- function(fit, label) {
+
+  cat(sprintf("\n%s\n  %s\n%s\n", strrep("=", 60), label, strrep("=", 60)))
+
+  fm <- fitmeasures(fit, c("chisq.scaled", "df.scaled", "pvalue.scaled",
+                            "cfi.scaled", "tli.scaled",
+                            "rmsea.scaled", "rmsea.ci.lower.scaled",
+                            "rmsea.ci.upper.scaled", "srmr"))
+  cat(sprintf("\nchi2 = %.1f (df = %.0f, p = %.4f)\n", fm[1], fm[2], fm[3]))
+  cat(sprintf("CFI = %.3f | TLI = %.3f | RMSEA = %.3f [%.3f, %.3f] | SRMR = %.3f\n",
+              fm[4], fm[5], fm[6], fm[7], fm[8], fm[9]))
+
+  std <- standardizedSolution(fit) |>
+    filter(op == "=~") |>
+    select(factor = lhs, item = rhs, loading = est.std, p = pvalue) |>
+    filter(!is.na(loading)) |>
+    arrange(factor, desc(abs(loading)))
+  cat("\nLoadings:\n"); print(as.data.frame(std))
+
+  fcor <- standardizedSolution(fit) |>
+    filter(op == "~~", lhs != rhs, lhs %in% std$factor, rhs %in% std$factor)
+  if (nrow(fcor) > 0)
+    cat(sprintf("\nFactor correlation: %.3f\n", fcor$est.std[1]))
+
+  omega <- tryCatch(compRelSEM(fit), error = function(e) NULL)
+  ave   <- tryCatch(AVE(fit), error = function(e) NULL)
+  if (!is.null(omega)) cat(sprintf("omega: %s\n",
+    paste(names(omega), round(omega, 3), sep = " = ", collapse = ", ")))
+  if (!is.null(ave)) cat(sprintf("AVE:   %s\n",
+    paste(names(ave), round(ave, 3), sep = " = ", collapse = ", ")))
+
+  mi <- modificationIndices(fit, sort. = TRUE, op = "~~", free.remove = FALSE) |>
+    filter(mi > 10) |>
+    slice_head(n = 5)
+  if (nrow(mi) > 0) {
+    cat("\nTop modification indices (> 10):\n")
+    print(as.data.frame(mi |> select(lhs, rhs, mi)))
+  }
+
+  invisible(fit)
+}
+
+```
+
+### We find that the president trust item is problematic and test a 1 factor cfa without. 
+
+```{r}
+
+trust_items_lapop <- c("justice_system", "electoral_tribunal", "armed_forces",
+                     "legislature", "public_ministry", "police", "auditor",
+                     "political_parties", "supreme_court", "municipality",
+                     "media", "elections")
+
+trust_lapop_df <- lapop |> select(all_of(trust_items_lapop)) 
+
+# 1-factor, 12 items, freed residual covariances
+mod_1f_trim <- '
+  Trust =~ justice_system + electoral_tribunal + armed_forces +
+           legislature + public_ministry + police + auditor +
+           political_parties + supreme_court + municipality +
+           media + elections
+  armed_forces ~~ legislature
+  public_ministry ~~ auditor
+'
+
+fit_1f_trim <- cfa(mod_1f_trim, data = trust_lapop_df, 
+                    ordered = setdiff(trust_items_lapop, "president"),
+                    estimator = "WLSMV")
+
+diagnose_cfa(fit_1f_trim, "1-FACTOR (12 items, 2 freed covariances)")
+```
+
+#### **12-item unidimensional Institutional Trust factor**, with two freed residual covariances (armed_forces \~\~ legislature, public_ministry \~\~ auditor), president dropped. This is what the data support — the EFA said one dominant factor, the CFA confirms it once the misfit item is removed and substantively justified correlated errors are freed. This will be our production script.
+
+We move to estimating the correlation between the latent factor and our outcome variables.
+
+```{r}
+
+# Factor scores
+fs <- lavPredict(fit_1f_trim, method = "regression") |> as_tibble()
+
+lapop_fs <- lapop |>
+  filter(if_all(all_of(trust_items_lapop), ~ !is.na(.x))) |>
+  bind_cols(fs)
+
+# Correlations
+cor(lapop_fs$Trust,
+    lapop_fs |> select(satis_demo_lapop, prez_rating) |> mutate(across(everything(), as.numeric)),
+    use = "complete.obs")
+```
+
+\newpage
+
+## We now explore the factor structure of the LB data.
+
+```{r}
+lb_trust <- run_efa(lb |> select(Armed_forces:President), max_factors = 3)
+```
+
+The Latinobarómetro trust items are clearly not unidimensional. The 1-factor model is unacceptable (TLI = .636, RMSEA = .215), meaning these 9 items cannot be treated as measuring a single construct. The 3-factor solution provides the cleanest simple structure: Factor 1 is political trust (Natl_Govt .85, President .80, Parties .71, Congress .68, Electoral_Inst .66, Judiciary .65), Factor 2 is security institutions (Armed_forces .87, Police .78), and Factor 3 is Church alone (.85). Factor correlations are moderate and distinct (.45, .34, .20), confirming these are separable dimensions. The 2-factor solution is messy — Congress, Judiciary, Parties, and Electoral_Inst all cross-load heavily (complexity \~1.9), meaning the 2-factor structure forces ambiguous assignments. Church is the problem item: it loads .29 on the general factor, forms its own single-item factor in the 3-factor solution, and has near-zero correlations with President (.03) and Natl_Govt (.08). It is substantively distinct from institutional trust and should be dropped. That leaves a 2-factor CFA: Political Trust (6 items) and Security Trust (Armed_forces, Police), with Natl_Govt \~\~ President (r = .81 in the polychoric matrix) as a likely candidate for a freed residual covariance.
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# CFA — Latinobarómetro Colombia (8 items, Church dropped)
+# ══════════════════════════════════════════════════════════════════════════════
+
+set.seed(721)
+
+trust_items_lb <- c("Armed_forces", "Police", "Congress", "Natl_Govt",
+                     "Judiciary", "Parties", "Electoral_Inst", "President")
+
+trust_lb_df <- lb |> select(all_of(trust_items_lb)) 
+
+# ── 1-factor (baseline) ─────────────────────────────────────────────────────
+mod_lb_1f <- '
+  Trust =~ Armed_forces + Police + Congress + Natl_Govt +
+           Judiciary + Parties + Electoral_Inst + President
+'
+
+# ── 2-factor (EFA-informed) ─────────────────────────────────────────────────
+mod_lb_2f <- '
+  Political =~ Congress + Natl_Govt + Judiciary + Parties +
+               Electoral_Inst + President
+  Security  =~ Armed_forces + Police
+'
+
+# ── 2-factor with freed covariance ──────────────────────────────────────────
+mod_lb_2f_free <- '
+  Political =~ Congress + Natl_Govt + Judiciary + Parties +
+               Electoral_Inst + President
+  Security  =~ Armed_forces + Police
+  Natl_Govt ~~ President
+'
+
+# ── Fit all three ────────────────────────────────────────────────────────────
+fit_lb_1f     <- cfa(mod_lb_1f, data = trust_lb_df,
+                      ordered = trust_items_lb, estimator = "WLSMV")
+fit_lb_2f     <- cfa(mod_lb_2f, data = trust_lb_df,
+                      ordered = trust_items_lb, estimator = "WLSMV")
+fit_lb_2f_free <- cfa(mod_lb_2f_free, data = trust_lb_df,
+                       ordered = trust_items_lb, estimator = "WLSMV")
+
+
+# ── Diagnose ─────────────────────────────────────────────────────────────────
+diagnose_cfa(fit_lb_1f, "LB 1-Factor (8 items)")
+diagnose_cfa(fit_lb_2f, "LB 2-Factor: Political + Security")
+diagnose_cfa(fit_lb_2f_free, "LB 2-Factor + freed Natl_Govt ~~ President")
+
+# ── LRT comparison ───────────────────────────────────────────────────────────
+lavTestLRT(fit_lb_1f, fit_lb_2f)
+```
+
+The 2-factor with freed Natl_Govt \~\~ President is the Colombia measurement model. CFI = .988, TLI = .981, RMSEA = .071, SRMR = .033 — all criteria pass. The factor correlation at .550 is moderate, confirming Political and Security are genuinely distinct dimensions (unlike the LAPOP 2-factor at .910). The LRT confirms the 2-factor is significantly better than 1-factor.
+
+```{r}
+fs_lb <- lavPredict(fit_lb_2f_free, method = "regression") |> as_tibble()
+
+lb_fs <- lb |>
+  filter(if_all(all_of(trust_items_lb), ~ !is.na(.x))) |>
+  bind_cols(fs_lb)
+
+cor(lb_fs |> select(Political, Security),
+    lb_fs |> select(satis_demo_lb, governed_for) |> mutate(across(everything(), as.numeric)),
+    use = "complete.obs")
+```
+
+**Political Trust → satis_demo_lb (r = .37):** Higher factor score (less trust) → higher satis_demo values (less satisfied). Equivalently, people who trust political institutions more are more satisfied with democracy. Intuitive direction, moderate-strong relationship.
+
+**Political Trust → governed_for (r = -.29):** Higher factor score (less trust) → lower governed_for (1 = powerful groups). People with less political trust think the country is governed by powerful groups. Intuitive direction, moderate relationship.
+
+**Security → satis_demo_lb (r = .21):** Same direction as Political but weaker. Security institution trust matters less for democratic satisfaction.
+
+**Security → governed_for (r = -.07):** Essentially zero. Whether you trust the armed forces and police has almost no bearing on whether you think the country is governed for everyone's benefit. This makes substantive sense — governance perceptions are about political power, not security institutions.
+
+We drop the security factor and find cleaner results.
+
+\newpage
+
+|   | LAPOP Mexico | Latinobarómetro Colombia |
+|----|----|----|
+| **Items** | 12 (of 13, president dropped) | 6 (of 9, Church/Armed_forces/Police dropped) |
+| **Factors** | 1 (Trust) | 1 (Political) |
+| **Freed covariances** | armed_forces \~\~ legislature, public_ministry \~\~ auditor | Natl_Govt \~\~ President |
+| **CFI / TLI** | .964 / .955 | .992 / .985 |
+| **RMSEA** | .056 | .077 |
+| **omega** | .922 | .793 |
+| **AVE** | .521 | .551 |
+| **→ satis_demo** | r = -.33 | r = .37 |
+| **→ prez_rating / governed_for** | r = -.26 | r = -.30 |
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# Final CFA Models — Both Surveys
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── LAPOP Mexico: 12-item unidimensional Trust ───────────────────────────────
+# President dropped (weak loading, single-item EFA factor, misfit source)
+# Two freed residual covariances (substantively justified):
+#   armed_forces ~~ legislature    (state power institutions)
+#   public_ministry ~~ auditor     (oversight/accountability bodies)
+
+lapop_cfa <- '
+  Trust =~ justice_system + electoral_tribunal + armed_forces +
+           legislature + public_ministry + police + auditor +
+           political_parties + supreme_court + municipality +
+           media + elections
+  armed_forces ~~ legislature
+  public_ministry ~~ auditor
+'
+
+# ── Latinobarómetro Colombia: 6-item unidimensional Political Trust ──────────
+# Church dropped (h2 = .085, near-zero correlations with political items)
+# Armed_forces and Police dropped (Security factor uncorrelated with outcomes)
+# One freed residual covariance (substantively justified):
+#   Natl_Govt ~~ President  (polychoric r = .81, conceptual overlap)
+
+lb_cfa <- '
+  Political =~ Congress + Natl_Govt + Judiciary + Parties +
+               Electoral_Inst + President
+  Natl_Govt ~~ President
+'
+```
+
+## To save data into a .rds we will combine both surveys into a list wtih two elements.
+
+```{r}
+
+survey_list <- list(
+  # drop president variable
+  lapop |> select(-president), 
+  # drop armed forces, police, and church
+  lb |> select(-Armed_forces:-Church)) |> 
+  set_names(c("lapop", "lb"))
+
+write_rds(survey_list,
+          file = str_c(
+            results_dir, "/survey_data.rds")
+          )
+```
