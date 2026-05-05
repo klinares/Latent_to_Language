@@ -2,8 +2,7 @@
 
 **Can Psychometric-Informed Prompts Improve LLM-Based Survey Item Imputation?**
 
-Kevin Linares \| Joint Program in Survey Methodology, University of Maryland\
-SURV 721: Total Survey Error II
+Kevin Linares \| Joint Program in Survey Methodology, University of Maryland
 
 ![](images/clipboard-3237513583.png)
 
@@ -205,8 +204,3 @@ Pairwise method comparisons use Nadeau-Bengio corrected t-tests.
 }
 ```
 
-## License
-
-Academic coursework, University of Maryland. Available for research and educational purposes.
-
-## 
