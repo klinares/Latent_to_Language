@@ -4,6 +4,8 @@
 
 Kevin Linares \| Joint Program in Survey Methodology, University of Maryland
 
+Paper -> [Latent-to-Language Manuscript](https://github.com/klinares/Latent_to_Language/blob/main/manuscript/final_paper_linares.pdf)
+
 ![](images/clipboard-3237513583.png)
 
 ## Overview
