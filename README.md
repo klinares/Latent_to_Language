@@ -17,18 +17,20 @@ Using two nationally representative surveys — **LAPOP Mexico 2023** (N = 1,430
 
 ## Key Findings
 
--   **Psychometric context improves item recovery monotonically**: Claude Sonnet weighted kappa from .645 (S) → .667 (P1) → .675 (P2) on LAPOP; .550 → .559 → .579 on Latinobarómetro
--   **LLMs outperform traditional methods at the fair comparison (S tier)**: Claude Sonnet (.645 LAPOP, .550 LB) vs. mixgb (.615, .463) and miceRanger (.561, .504)
--   **All methods preserve construct ordering**: r \> .983 with ground truth θ on LAPOP; Claude achieves r = .930 on LB vs. mixgb .895
--   **Imputation error is overwhelmingly random**: Systematic bias accounts for less than 1% of total MSE for Claude Sonnet, less than 3% for mixgb (Biemer decomposition)
--   **Psychometric context reduces centripetal compression**: Compression slope moves from −0.464 (S) to −0.363 (P2) on LAPOP; Claude P2 compresses less than mixgb S on both surveys
--   **Prior-attitude interference**: Items where LLM world-knowledge priors conflict with population attitudes (armed_forces) show systematic directional bias — a processing error mechanism unique to LLM-based imputation
+- **Item-level — psychometric context reduces item-level error monotonically**: Claude Sonnet weighted kappa rises .645 (S) → .667 (P1) → .675 (P2) on LAPOP and .550 → .559 → .579 on Latinobarómetro. At the fair comparison (S tier), Claude Sonnet (.645 LAPOP, .550 LB) outperforms mixgb (.615, .463) and miceRanger (.561, .504).
+- **Item-level — the psychometric anchor helps most when the task is hardest**: under heavy masking (3–4 of 6 items) on the short Latinobarómetro scale, Claude Sonnet P2 declines only modestly (.612 → .567) while mixgb S collapses (.604 → .399, a 34% degradation).
+- **Person-level — all methods preserve ordering, but only the LLM preserves scale**: correlations with ground-truth θ exceed .98 on LAPOP (Claude .989 at S, .988 at P2); on the shorter LB scale Claude (.930) beats mixgb (.895). Claude P2 holds the regression slope near 1.0 on both surveys, while mixgb S compresses the LB latent distribution by 11% (slope 0.89).
+- **Instrument-level — both methods inflate IRT discrimination, with structurally different error**: every item shows positive Δa (LAPOP mean +0.09 Claude P2 / +0.05 mixgb S; LB +0.20 / +0.05). Absolute distortion is small (\< 5% relative on LAPOP), but Claude P2's error is predominantly systematic (89% LAPOP, 86% LB Bias²) while mixgb S is more balanced (75%, 33%); deletion adds near-zero bias but large variance.
+- **Complementary error motivates stacking, not competition**: because LLM and tree-based methods carry structurally different error profiles, using L2L as a psychometric context layer over traditional imputation is more promising than choosing one method over the other.
+- **Prior-attitude interference**: items where LLM world-knowledge priors conflict with population attitudes (armed_forces) show systematic directional bias — an LLM-specific bias mechanism and a caution for cross-national use.
 
 ## Research Questions
 
-1.  **RQ1 — Psychometric Context Utilization**: To what extent does communicating progressively richer psychometric model information improve LLM-based item imputation and under what conditions (e.g., LLM architecture)?
-2.  **RQ2 — Construct-Level Recovery**: How closely do imputed data preserve respondents' positions on the latent construct, as measured by the correlation and regression slope between ground truth and imputed θ estimates?
-3.  **RQ3 — Measurement Error Structure**: What is the structure of the measurement error that imputation introduces at the item level through psychometric context engineering?
+Within the Total Survey Error framework, imputation is a processing decision whose consequences register as **measurement error**. The three research questions trace that error across three levels of analysis:
+
+1.  **RQ1 — Item-level measurement error**: To what extent does communicating progressively richer psychometric model information reduce item-level prediction error, and how does performance degrade as the proportion of masked items within a scale increases?
+2.  **RQ2 — Person-level measurement error**: How well do imputed data preserve respondents' positions on the latent construct, as measured by the correlation and regression slope between ground-truth and imputed θ estimates?
+3.  **RQ3 — Instrument-level measurement error**: To what extent does imputation alter the psychometric properties of the measurement instrument, and do LLM-based and tree-based methods introduce structurally different distortion profiles?
 
 ## Tier Design
 
@@ -54,8 +56,8 @@ Note: Traditional methods at P1/P2 also see the complete training response matri
 
 Demographics screened using η² with both IRT theta and CFA factor score (threshold ≥ 0.005). Survivors per survey:
 
--   **LAPOP**: age_cat, Edu, Urban, Employment (male dropped)
--   **LB**: age_cat, Edu, Employment (male + Urban dropped)
+- **LAPOP**: age_cat, Edu, Urban, Employment (male dropped)
+- **LB**: age_cat, Edu, Employment (male + Urban dropped)
 
 ## Repository Structure
 
@@ -107,10 +109,10 @@ Script 03 (Traditional)    Script 04 (LLM Imputation)
     └──────────┬───────────────┘
                ▼
          Script 05 (Results)
-           RQ1: Weighted kappa, accuracy by tier
-           RQ2: θ correlation, regression slope
-           RQ3: Biemer decomposition, compression slope
-           Signed error heatmaps, per-item analysis
+           RQ1 (item-level): Weighted kappa, accuracy by tier
+           RQ2 (person-level): θ correlation, regression slope
+           RQ3 (instrument-level): Biemer decomposition of IRT discrimination (Δa)
+           Item variance shrinkage, per-item analysis
 ```
 
 ## Prompt Design (V2)
@@ -126,11 +128,11 @@ The prompt architecture communicates model **conclusions**, not parameters:
 
 ### What was dropped from V1
 
--   IRT discrimination/threshold tables
--   CFA standardized loadings
--   Q3 residual correlation matrices
--   Conditional expectations E[X_miss \| X_obs]
--   Chain-of-thought reasoning
+- IRT discrimination/threshold tables
+- CFA standardized loadings
+- Q3 residual correlation matrices
+- Conditional expectations E[X_miss \| X_obs]
+- Chain-of-thought reasoning
 
 ### Psychometrician Persona
 
@@ -163,35 +165,35 @@ Gemma 3 27B was evaluated but dropped from the final analysis.
 
 ## Evaluation Framework
 
-### RQ1 Metrics (Item-Level Recovery)
+### RQ1 Metrics (Item-Level Measurement Error)
 
 | Metric | Description |
 |:---------------------------|:-------------------------------------------|
 | Weighted kappa | Quadratic weighted kappa (primary); penalizes larger ordinal distances |
 | Accuracy | Exact match rate (secondary) |
 
-### RQ2 Metrics (Construct-Level Recovery)
+### RQ2 Metrics (Person-Level Measurement Error)
 
 | Metric | Description |
 |:---------------------------|:-------------------------------------------|
 | Pearson r | Correlation between ground truth θ and imputed θ; captures rank preservation |
 | Regression slope | Slope of θ_imputed on θ_truth; 1.0 = perfect, \< 1.0 = centripetal compression |
 
-### RQ3 Metrics (Measurement Error Structure)
+### RQ3 Metrics (Instrument-Level Measurement Error)
 
 | Metric | Description |
 |:---------------------------|:-------------------------------------------|
-| Biemer decomposition | MSE = Bias² + Variance per item; ratio quantifies systematic vs. random error |
-| Compression slope | Regression of signed error on actual category; negative = compression toward center |
+| Biemer decomposition of discrimination | MSE of Δa (= a_imputed − a_gold) = Bias² + Variance per item; ratio quantifies systematic vs. random distortion of the measurement model |
+| Item variance shrinkage | Change in item response variance after imputation; negative = compression of the response spread |
 
 Pairwise method comparisons use Nadeau-Bengio corrected t-tests.
 
 ## Requirements
 
--   **R** ≥ 4.3 with `lavaan`, `mirt`, `semTools`, `tidySEM`, `mixgb`, `miceRanger`, `ellmer`, `furrr`, `viridis`, `gridExtra`, `tidyverse`, `tictoc`
--   **Quarto** ≥ 1.4 + LaTeX distribution
--   **API keys**: Anthropic (`ANTHROPIC_API_KEY`), OpenRouter (`OPENROUTER_API_KEY`) in `.Renviron`
--   **Data**: [LAPOP 2023](https://www.vanderbilt.edu/lapop/) and [Latinobarómetro 2023](https://www.latinobarometro.org/)
+- **R** ≥ 4.3 with `lavaan`, `mirt`, `semTools`, `tidySEM`, `mixgb`, `miceRanger`, `ellmer`, `furrr`, `viridis`, `gridExtra`, `tidyverse`, `tictoc`
+- **Quarto** ≥ 1.4 + LaTeX distribution
+- **API keys**: Anthropic (`ANTHROPIC_API_KEY`), OpenRouter (`OPENROUTER_API_KEY`) in `.Renviron`
+- **Data**: [LAPOP 2023](https://www.vanderbilt.edu/lapop/) and [Latinobarómetro 2023](https://www.latinobarometro.org/)
 
 ## Citation
 
