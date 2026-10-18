@@ -16,7 +16,8 @@ bibliography: references.bib
 format:
   apaquarto-pdf:
     documentmode: man
-    keep-tex: false
+    keep-tex: true
+    latex-clean: false
     floatsintext: true
 execute:
   echo: false
@@ -38,7 +39,7 @@ library(kableExtra)
 
 set.seed(721)
 
-data_dir <- "D:/repos/UMD_classes_code/TSE_II_SURV721/results"
+data_dir <- "D:/repos/Latent_to_Language/results"
 
 # ── Load survey data ─────────────────────────────────────────
 survey_list <- readRDS(file.path(data_dir, "survey_data.rds"))
